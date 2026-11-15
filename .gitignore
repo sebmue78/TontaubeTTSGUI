@@ -13,3 +13,6 @@ android/local.properties
 android/.kotlin/
 android/.idea/
 *.iml
+android/e2e-screens/
+android/instrument.txt
+android/e2e-logcat.txt

@@ -98,6 +98,35 @@ Entfernen die App und die drei Ordner oben löschen.
 
 ffmpeg und opus werden bei Bedarf über Homebrew installiert.
 
+## Android-App „Tontaube Vorlesen“
+
+Eine Vorlese-App für Android (ab Android 8), die Dokumente über den Tontaube-Server der Desktop-App
+vorliest. Quellcode in [`android/`](android/), Kotlin + Jetpack Compose (Material 3).
+
+| Bereich | Was die App kann |
+|---|---|
+| **Import** | PDF (mit Textebene), EPUB (ohne DRM), TXT, Markdown, HTML, DOCX, ODT, RTF, FB2, eingefügter oder geteilter Text. Kapitel werden erkannt (Inhaltsverzeichnis, Überschriften), Kopf-/Fußzeilen und Silbentrennung in PDFs bereinigt. |
+| **Projekte** | Jedes Dokument wird ein Vorlese-Projekt mit eigener Stimme, Sprache, Stil, Temperatur, den Stil-Reglern (Tempo, Pausen, Ausdruck, Stimmlage, Artikulation), Seed, Puffer und Wiedergabe-Tempo. |
+| **Vorlesen** | Streaming über `POST /stream`: der Text wird in Abschnitte (ca. 450 Zeichen) geteilt, die Wiedergabe beginnt nach wenigen Sekunden, die folgenden Abschnitte werden bis zu zwei Minuten im Voraus erzeugt. Pause und Fortsetzen an der genauen Stelle, auch nach Neustart. Hintergrund-Wiedergabe mit Benachrichtigung und Sperrbildschirm-Steuerung. Mitlesen mit hervorgehobenem Abschnitt, Sprung per Antippen oder Kapitelliste. |
+| **Zwischenspeicher** | Fertig erzeugte Abschnitte bleiben als MP3 auf dem Handy. Bereits gehörte Stellen laufen ohne Server und lassen sich spulen. Geänderte Einstellungen verwerfen das alte Audio des Projekts. |
+| **Eigene Stimmen** | In der App aufnehmen (5–60 s) oder Audiodatei wählen. Wird lokal gespeichert und bei jeder Anfrage als `voice_audio_b64` mitgeschickt (der Server merkt sich den Stimmen-Prompt). Die 39 mitgelieferten Stimmen sind ebenfalls wählbar, jeweils mit Hörprobe. |
+| **Server** | Verbindung per QR-Code aus der Desktop-App oder manuell (Adresse + API-Key), mehrere Server, Verbindungstest. |
+
+**Installieren:** [Releases → android-latest](https://github.com/sebmue78/TontaubeTTSGUI/releases/tag/android-latest)
+→ `Tontaube-Vorlesen.apk` auf dem Handy öffnen (einmalig „Installation aus unbekannten Quellen“ erlauben).
+Die APK wird bei jedem Push von GitHub Actions gebaut und getestet.
+
+**Verbinden:** In der Desktop-App unter **📱 Im Netzwerk freigeben (Android-App)** den Schalter aktivieren
+(der Server startet dafür neu und bindet an alle Netzwerkschnittstellen, mit API-Key-Pflicht). In der
+Android-App unter **Einstellungen → QR-Code scannen**. Handy und Mac müssen im selben WLAN sein.
+
+Grenzen: Eingescannte PDFs ohne Textebene (bräuchten Texterkennung) und kopiergeschützte EPUBs lassen sich
+nicht lesen. Die Verbindung ist unverschlüsseltes HTTP, also nur fürs eigene Netz gedacht. Im CPU-Modus
+rechnet der Mac langsamer als Echtzeit, dann entstehen beim Streamen Pausen; auf der Apple-GPU reicht das Tempo.
+
+Selbst bauen (Android-SDK nötig): `cd android && ./gradlew :app:assembleRelease`.
+Nur die plattformunabhängige Logik testen: `./gradlew :core:test`.
+
 ## Wie es aufgebaut ist
 
 TontaubeV1.1 ist kein normales `transformers`-Modell. Laut Modellkarte läuft es nur über den
