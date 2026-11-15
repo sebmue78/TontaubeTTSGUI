@@ -10,6 +10,10 @@ import datetime as dt
 import json
 import os
 import re
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -423,7 +427,8 @@ Alle Ergebnisse landen mit den verwendeten Parametern (JSON) in `{OUTPUT_DIR}`.
 """
 
 
-def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "") -> gr.Blocks:
+def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manager=None) -> gr.Blocks:
+    """manager: optionaler :class:`tontaube_gui.launcher.ServerManager` (All-in-one-Modus)."""
     with gr.Blocks(title="Tontaube TTS", css=CSS, theme=gr.themes.Soft()) as demo:
         specs_state = gr.State(list(DEFAULT_CONTROLS))
         history_state = gr.State([])
@@ -432,9 +437,28 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "") -> gr
         gr.Markdown("# 🕊️ Tontaube TTS", elem_id="title")
         gr.Markdown("Oberfläche für **TontaubeV1.1** · mehrsprachige Sprachsynthese mit Voice Cloning")
 
-        with gr.Accordion("Server", open=True):
+        if manager is not None:
+            with gr.Group():
+                managed_status = gr.Markdown(manager.status_markdown())
+            with gr.Accordion("Eingebauter Server", open=False):
+                with gr.Row():
+                    dtype_choice = gr.Dropdown(
+                        [("bfloat16 – halber Speicherbedarf", "bfloat16"), ("float32 – höchste Genauigkeit", "float32")],
+                        value=manager.dtype,
+                        label="Rechengenauigkeit (gilt nach Neustart)",
+                        scale=2,
+                    )
+                    restart_btn = gr.Button("Server neu starten", scale=1)
+                    reinstall_btn = gr.Button("Einrichtung wiederholen", scale=1)
+                    folder_btn = gr.Button("Ausgabeordner öffnen", scale=1)
+                    quit_btn = gr.Button("Tontaube beenden", variant="stop", scale=1)
+                managed_log = gr.Code(manager.log_tail(), label="Protokoll", lines=14, interactive=False)
+            connected_state = gr.State(False)
+            timer = gr.Timer(2.0)
+
+        with gr.Accordion("Server-Verbindung", open=manager is None, visible=True):
             with gr.Row():
-                url = gr.Textbox(default_url, label="Server-URL", scale=3)
+                url = gr.Textbox(manager.url if manager else default_url, label="Server-URL", scale=3)
                 api_key = gr.Textbox(default_key, label="API-Key (x-api-key, optional)", type="password", scale=2)
                 timeout = gr.Number(600, label="Timeout (s)", minimum=10, scale=1)
                 check_btn = gr.Button("Verbindung testen", scale=1)
@@ -664,6 +688,54 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "") -> gr
 
         clear_btn.click(clear_history, None, [history_state, last_state, history_table, history_files])
 
+        if manager is not None:
+            check_outputs = [server_status, specs_state, voice_path, *slot_components]
+
+            def tick(connected, key, tmo):
+                ready = manager.state.phase == "ready"
+                base = [manager.status_markdown(), manager.log_tail()]
+                if ready and not connected:
+                    return [*base, gr.update(value=manager.url), True, *check_server(manager.url, key, tmo)]
+                if not ready and connected:
+                    return [*base, gr.update(), False, *[gr.skip()] * len(check_outputs)]
+                return [*base, gr.update(), connected, *[gr.skip()] * len(check_outputs)]
+
+            timer.tick(
+                tick,
+                [connected_state, api_key, timeout],
+                [managed_status, managed_log, url, connected_state, *check_outputs],
+                show_progress="hidden",
+            )
+
+            def do_restart(dtype):
+                threading.Thread(target=manager.restart, kwargs={"dtype": dtype}, daemon=True).start()
+                return False
+
+            restart_btn.click(do_restart, dtype_choice, connected_state)
+            reinstall_btn.click(
+                lambda: (threading.Thread(target=manager.reinstall, daemon=True).start(), False)[1],
+                None,
+                connected_state,
+            )
+
+            def open_folder():
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, str(OUTPUT_DIR)])
+
+            folder_btn.click(open_folder)
+
+            def quit_app():
+                def _bye():
+                    time.sleep(0.5)
+                    manager.stop()
+                    os._exit(0)
+
+                threading.Thread(target=_bye, daemon=True).start()
+                return "**Tontaube wird beendet.** Dieses Fenster kann geschlossen werden."
+
+            quit_btn.click(quit_app, None, managed_status)
+
     return demo
 
 
@@ -674,13 +746,27 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default=os.environ.get("GUI_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("GUI_PORT", "7860")))
     parser.add_argument("--share", action="store_true", help="Öffentlichen Gradio-Link erzeugen")
+    parser.add_argument(
+        "--managed",
+        action="store_true",
+        help="All-in-one-Modus: Tontaube-Server selbst einrichten, Modelle laden und starten",
+    )
+    parser.add_argument("--inbrowser", action="store_true", help="Browser automatisch öffnen")
     args = parser.parse_args(argv)
 
-    demo = build_ui(args.server_url, args.api_key)
+    manager = None
+    if args.managed:
+        from .launcher import ServerManager
+
+        manager = ServerManager()
+        manager.start()
+
+    demo = build_ui(args.server_url, args.api_key, manager=manager)
     demo.queue(default_concurrency_limit=4).launch(
         server_name=args.host,
         server_port=args.port,
         share=args.share,
+        inbrowser=args.inbrowser,
         allowed_paths=[str(OUTPUT_DIR)],
     )
 

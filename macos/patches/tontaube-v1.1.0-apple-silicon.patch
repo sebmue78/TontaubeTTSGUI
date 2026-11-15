@@ -146,3 +146,30 @@ index ffeebd4..84f3c30 100644
      with _LOCK:
          if _EXT is None:
              from torch.utils.cpp_extension import load
+diff --git a/app/opus_stream.py b/app/opus_stream.py
+index ea858ee..a377638 100644
+--- a/app/opus_stream.py
++++ b/app/opus_stream.py
+@@ -10,7 +10,12 @@ The client uses WebCodecs AudioDecoder to decode each frame individually.
+ import struct
+ 
+ import numpy as np
+-import opuslib
++
++try:  # libopus is optional: without it only the /ws/stream route is unavailable
++    import opuslib
++except Exception as _opus_exc:  # pragma: no cover - depends on the system library
++    opuslib = None
++    _OPUS_IMPORT_ERROR = _opus_exc
+ 
+ # Opus frame duration in seconds — 20ms is the standard for real-time audio
+ FRAME_DURATION = 0.02
+@@ -22,6 +27,8 @@ class OpusStreamEncoder:
+     def __init__(self, sample_rate: int = 24000, bitrate: int = 32000):
+         self._sr = sample_rate
+         self._frame_samples = int(sample_rate * FRAME_DURATION)
++        if opuslib is None:
++            raise RuntimeError(f"Opus streaming needs libopus: {_OPUS_IMPORT_ERROR}")
+         self._encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_AUDIO)
+         self._encoder.bitrate = bitrate
+ 
