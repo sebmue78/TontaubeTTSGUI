@@ -1,0 +1,148 @@
+diff --git a/app/lite/cpu/engine.py b/app/lite/cpu/engine.py
+index e86dc34..21a7cd9 100644
+--- a/app/lite/cpu/engine.py
++++ b/app/lite/cpu/engine.py
+@@ -14,7 +14,7 @@ from app.lite.cpu.model import CpuCodebookModel
+ from app.lite.requests import Completion, Output, Request
+ from app.lite.sampling import SamplingParams, SeqSampling, sample, update_counts
+ from app.logging_utils import get_logger
+-from app.native import kernels
++from app.native import available as native_available, kernels
+ 
+ logger = get_logger("lite")
+ 
+@@ -141,7 +141,10 @@ def build_cpu_engines(config, model_paths: list[str], plans, bundle,
+     from app.lite.weights import LazyWeights, load_bundle
+ 
+     torch.set_num_threads(int(os.getenv("LITE_CPU_THREADS", str(torch.get_num_threads()))))
+-    kernels()
++    if native_available():
++        kernels()
++    else:
++        logger.info("No AVX2 kernels on this CPU: dense %s weights with plain torch ops", __import__('app.lite.cpu.linear', fromlist=['x']).fallback_dtype())
+     engines = []
+     for cb, path in enumerate(model_paths):
+         prequant = None
+diff --git a/app/lite/cpu/linear.py b/app/lite/cpu/linear.py
+index 7d307dd..8b3d0bd 100644
+--- a/app/lite/cpu/linear.py
++++ b/app/lite/cpu/linear.py
+@@ -7,7 +7,16 @@ import torch
+ import torch.nn.functional as F
+ 
+ from app.lite.quant import QLinear, unpack_codes
+-from app.native import kernels
++from app.native import available as native_available, kernels
++
++
++def fallback_dtype() -> torch.dtype:
++    """Weight dtype of dense layers without native kernels (LITE_CPU_DTYPE: float32, bfloat16, float16)."""
++    import os
++
++    name = os.getenv("LITE_CPU_DTYPE", "float32").strip().lower()
++    return {"float32": torch.float32, "fp32": torch.float32, "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
++            "float16": torch.float16, "fp16": torch.float16}[name]
+ 
+ 
+ class CpuLinear:
+@@ -21,7 +30,13 @@ class CpuLinear:
+         self.kind = "f32"
+         bits, group = q.spec.bits, q.spec.group
+         if q.weight is not None:
+-            self.weight = q.weight.float().contiguous()
++            self.weight = q.weight.to(fallback_dtype() if not native_available() else torch.float32).contiguous()
++            return
++        if not native_available():
++            from app.lite.quant import dequantize_ref
++
++            self.weight = dequantize_ref(q.codes.cpu(), q.scales.cpu(), q.mins.cpu(), bits, group,
++                                         q.k_in).to(fallback_dtype()).contiguous()
+             return
+         codes = unpack_codes(q.codes.cpu(), bits, q.k_in)  # [N, K] uint8
+         scales, mins = q.scales.cpu().float(), q.mins.cpu().float()
+@@ -55,6 +70,9 @@ class CpuLinear:
+     def __call__(self, x: torch.Tensor, qx=None) -> torch.Tensor:
+         """x [M, K] fp32; qx: optional pre-quantized activations for x."""
+         if self.kind == "f32":
++            if self.weight.dtype != torch.float32:
++                b = self.bias.to(self.weight.dtype) if self.bias is not None else None
++                return F.linear(x.to(self.weight.dtype), self.weight, b).float()
+             return F.linear(x, self.weight, self.bias)
+         ext = kernels()
+         if x.shape[0] <= self.GEMV_MAX_ROWS:
+diff --git a/app/lite/cpu/model.py b/app/lite/cpu/model.py
+index c5637e3..cf0d49d 100644
+--- a/app/lite/cpu/model.py
++++ b/app/lite/cpu/model.py
+@@ -11,7 +11,7 @@ from app.lite.cpu.linear import CpuLinear
+ from app.lite.quant import QLinear
+ from app.lite.weights import LazyWeights, load_codebook_weights, text_embedding_rows
+ from app.model.positions import get_codebook_vocab_size, prefill_positions
+-from app.native import kernels
++from app.native import available as native_available, kernels
+ 
+ 
+ def _rms(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+@@ -65,7 +65,7 @@ class CpuCodebookModel:
+         """Fused one-token step (app/native/lm_kernels.cpp Decoder) when every layer linear is q4/q8."""
+         cfg = self.cfg
+         lins = [L[n] for L in self.layers for n in ("qkv", "o", "gate_up", "down")]
+-        if cfg.head_dim != 128 or any(lin.kind == "f32" for lin in lins):
++        if not native_available() or cfg.head_dim != 128 or any(lin.kind == "f32" for lin in lins):
+             return None
+         norms = [L[n] for L in self.layers for n in ("in_norm", "post_norm", "q_norm", "k_norm")]
+         tensors = []
+@@ -129,7 +129,7 @@ class CpuCodebookModel:
+         x = self._embed(torch.tensor(ids, dtype=torch.long))
+         end = start + T
+         del self.seq_ids[start:], self.seq_pos[start:]
+-        ext = kernels()
++        ext = kernels() if native_available() else None
+         for li, L in enumerate(self.layers):
+             h = _rms(x, L["in_norm"], cfg.rms_eps)
+             qkv = L["qkv"](h)
+@@ -141,13 +141,13 @@ class CpuCodebookModel:
+             kc, vc = self.kv[li, 0], self.kv[li, 1]
+             kc[:, start:end] = k.transpose(0, 1).to(kc.dtype)
+             vc[:, start:end] = v.view(T, nkv, hd).transpose(0, 1).to(vc.dtype)
+-            if T == 1 and hd == 128 and kc.dtype == torch.bfloat16:
++            if ext is not None and T == 1 and hd == 128 and kc.dtype == torch.bfloat16:
+                 a = ext.decode_attn(q[0], kc, vc, end, self.scale)[None]
+             else:
+                 a = self._attend(q, kc, vc, start, end).reshape(T, nq * hd)
+             x = x + L["o"](a)
+             h = _rms(x, L["post_norm"], cfg.rms_eps)
+-            qh_act = ext.quantize_act(h) if T <= CpuLinear.GEMV_MAX_ROWS else None
++            qh_act = ext.quantize_act(h) if ext is not None and T <= CpuLinear.GEMV_MAX_ROWS else None
+             g, u = L["gate_up"](h, qh_act).chunk(2, dim=-1)
+             x = x + L["down"](F.silu(g) * u)
+         self.seq_ids.extend(ids)
+diff --git a/app/native/__init__.py b/app/native/__init__.py
+index ffeebd4..84f3c30 100644
+--- a/app/native/__init__.py
++++ b/app/native/__init__.py
+@@ -12,6 +12,15 @@ import threading
+ from pathlib import Path
+ 
+ _SOURCES = ("module.cpp", "lm_kernels.cpp", "vibevoice_kernels.cpp")
++
++
++def available() -> bool:
++    """Whether the AVX2 kernels can be used here (x86-64 only; TONTAUBE_NATIVE_KERNELS=0 disables)."""
++    import platform
++
++    if os.getenv("TONTAUBE_NATIVE_KERNELS", "1").strip().lower() in ("0", "false", "off", "no"):
++        return False
++    return platform.machine().lower() in ("x86_64", "amd64")
+ _EXT = None
+ _LOCK = threading.Lock()
+ 
+@@ -19,6 +28,8 @@ _LOCK = threading.Lock()
+ def kernels():
+     """The compiled extension (built once per process, cached across runs)."""
+     global _EXT
++    if not available():
++        raise RuntimeError("native AVX2 kernels are unavailable on this CPU; using the plain torch path")
+     with _LOCK:
+         if _EXT is None:
+             from torch.utils.cpp_extension import load
