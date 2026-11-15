@@ -477,8 +477,8 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                     )
                     dtype_choice = gr.Dropdown(
                         [
-                            ("bfloat16 – empfohlen", "bfloat16"),
-                            ("float16", "float16"),
+                            ("float16 – empfohlen für die Apple-GPU", "float16"),
+                            ("bfloat16 – empfohlen für die CPU", "bfloat16"),
                             ("float32 – höchste Genauigkeit, doppelter Speicher", "float32"),
                         ],
                         value=manager.dtype,
@@ -765,6 +765,11 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                 return False
 
             restart_btn.click(do_restart, [device_choice, dtype_choice], connected_state)
+            device_choice.change(
+                lambda d: gr.update(value="float16" if d == "mps" else "bfloat16"),
+                device_choice,
+                dtype_choice,
+            )
             reinstall_btn.click(
                 lambda: (threading.Thread(target=manager.reinstall, daemon=True).start(), False)[1],
                 None,

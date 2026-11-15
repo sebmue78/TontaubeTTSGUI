@@ -101,6 +101,11 @@ class ServerState:
     started_at: float = field(default_factory=time.time)
 
 
+def default_dtype(device: str) -> str:
+    """float16 ist auf der Apple-GPU genauer und gleich schnell, bfloat16 spart auf der CPU Speicher."""
+    return "float16" if device == "mps" else "bfloat16"
+
+
 class ServerManager:
     PHASE_LABELS = {
         "idle": "⚪ Nicht gestartet",
@@ -121,8 +126,9 @@ class ServerManager:
         self.logs = self.home / "logs"
         self.log_file = self.logs / "server.log"
         self.preferred_port = port
-        self.dtype = dtype or os.environ.get("LITE_CPU_DTYPE", "bfloat16")
         self.device = device or os.environ.get("LITE_DEVICE") or default_device()
+        self._dtype_auto = not (dtype or os.environ.get("LITE_CPU_DTYPE"))
+        self.dtype = dtype or os.environ.get("LITE_CPU_DTYPE") or default_dtype(self.device)
         self._fell_back = False
         self.state = ServerState()
         self.proc: subprocess.Popen | None = None
@@ -212,11 +218,14 @@ class ServerManager:
         self.stop()
         if self._thread:
             self._thread.join(timeout=15)
-        if dtype:
-            self.dtype = dtype
         if device:
             self.device = device
             self._fell_back = False
+        if dtype:
+            self.dtype = dtype
+            self._dtype_auto = False
+        elif self._dtype_auto:
+            self.dtype = default_dtype(self.device)
         self.start()
 
     def reinstall(self) -> None:
@@ -262,6 +271,8 @@ class ServerManager:
                 # Metal-Pfad gescheitert: einmal automatisch auf der CPU versuchen.
                 self._log("Start auf der Apple-GPU fehlgeschlagen, versuche es auf der CPU …")
                 self.device, self._fell_back = "cpu", True
+                if self._dtype_auto:
+                    self.dtype = default_dtype("cpu")
                 self._start_server(tools_path)
                 self._wait_ready()
         except Exception as exc:  # noqa: BLE001 - alles soll in der GUI landen

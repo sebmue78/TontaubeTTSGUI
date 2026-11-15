@@ -44,10 +44,19 @@ Den Fortschritt zeigt die Oberfläche oben an. Ab dem zweiten Start ist sie nach
 2. DMG öffnen und **Tontaube TTS** in den Ordner **Programme** ziehen.
 3. Beim ersten Öffnen: Rechtsklick → **Öffnen** (die App ist nicht notarisiert).
 
-Gemessen auf einem MacBook Pro M5 Pro (64 GB): erster Start ca. 10 Minuten (vor allem Downloads),
-danach ca. 20 Sekunden bis „Bereit“. Die Erzeugung läuft auf der CPU mit etwa 1,4-facher
-Echtzeit (4 Sekunden Audio brauchen gut 5 Sekunden) und belegt rund 13 GB Arbeitsspeicher.
-Empfohlen sind daher mindestens 24 GB RAM.
+Die Erzeugung läuft standardmäßig auf der **Apple-GPU (Metal)**. Gemessen auf einem MacBook Pro
+M5 Pro (64 GB), erster Start ca. 10 Minuten (vor allem Downloads), danach ca. 20 Sekunden bis „Bereit“:
+
+| | Apple-GPU (Metal, float16) | CPU (bfloat16) |
+|---|---|---|
+| Ein Satz (ca. 4 s Audio) | ca. 2,1 s | ca. 5,7 s |
+| Langer Absatz | 7,0 s (0,52× Echtzeit) | 17,0 s (1,35× Echtzeit) |
+| Streaming, erster Teil | 1,5 s | 4,1 s |
+| Arbeitsspeicher (RSS) | ca. 5 GB | ca. 13,5 GB |
+
+Die erste Anfrage nach dem Start dauert etwas länger (Aufwärmen). Das Rechenwerk lässt sich unter
+**Eingebauter Server** umstellen; scheitert der Start auf der GPU, weicht die App automatisch auf
+die CPU aus. Empfohlen sind mindestens 16 GB RAM (GPU) bzw. 24 GB (CPU).
 
 ### App selbst bauen
 
@@ -80,6 +89,10 @@ Entfernen die App und die drei Ordner oben löschen.
 * Die x86-AVX2-Kernel des CPU-Backends werden auf anderen CPUs übersprungen; stattdessen rechnen
   die Modelle mit normalen PyTorch-Operationen (int4-Gewichte werden beim Laden entpackt).
   `LITE_CPU_DTYPE` wählt `bfloat16` (Standard, halber Speicher) oder `float32`.
+* `LITE_DEVICE=mps` nutzt die Apple-GPU: die Codebook-Modelle rechnen mit int4-Gewichten über
+  Metal (`torch._weight_int4pack_mm`), DualCodec-Decoder und VibeVoice laufen ebenfalls auf der GPU,
+  W2V-BERT auf der CPU. `LITE_CPU_DTYPE=float16` ist dort genauer als bfloat16 bei gleichem Tempo.
+  Schalter zum Eingrenzen von Problemen: `MPS_CODECS=0`, `LITE_MPS_INT4=0`, `VIBEVOICE_MPS_DTYPE`.
 * vLLM wird nicht installiert (gibt es für macOS nicht; das „lite“-Backend braucht es nicht).
 * libopus ist optional (nur für den WebSocket-Opus-Stream nötig).
 

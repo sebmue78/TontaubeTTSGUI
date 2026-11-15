@@ -11,6 +11,38 @@ index 81a5f0a..7461f5c 100644
      try:
          import torch
  
+diff --git a/app/inference.py b/app/inference.py
+index e0f9ad6..52348f8 100644
+--- a/app/inference.py
++++ b/app/inference.py
+@@ -60,6 +60,7 @@ from app.utils import (
+     resolve_voice_prompt,
+     truncate_voice_prompt,
+     codes_to_audio_tensor,
++    codec_device,
+     get_dc_inference,
+     free_memory,
+ )
+@@ -751,6 +752,10 @@ class TTSEngine:
+             if sm is not None:
+                 self.dc_inference.semantic_cfg["semantic_model"] = sm.to(torch.float16)
+             logger.debug("DualCodec weights converted to float16")
++        elif codec_device() == "mps":
++            # W2V-BERT (voice encodes only) stays on the CPU; the codec decoder runs on the Apple GPU in fp32
++            self.dc_inference.model = self.dc_inference.model.to("mps")
++            logger.info("DualCodec decoder on the Apple GPU (MPS), float32")
+         else:
+             logger.debug("DualCodec using float32 on CPU")
+         if self.config.backend == "lite":
+@@ -775,7 +780,7 @@ class TTSEngine:
+             if runtime_paths.vibevoice is None:
+                 raise RuntimeError("VibeVoice was enabled but its model did not resolve")
+             self.vv_tokenizer = load_vibevoice_tokenizer(
+-                runtime_paths.vibevoice, cpu_quant=self.config.lite_vibevoice_quant)
++                runtime_paths.vibevoice, device=codec_device(), cpu_quant=self.config.lite_vibevoice_quant)
+             if self.config.backend == "lite":
+                 self._quantize_vibevoice()
+             self.vv_engine = VVDecodeEngine(
 diff --git a/app/lite/__init__.py b/app/lite/__init__.py
 index 0ae48ce..4661aaa 100644
 --- a/app/lite/__init__.py
@@ -97,10 +129,17 @@ index e86dc34..5c96c1e 100644
                      cb, plan.describe(), model.weight_bytes() / 2**20,
                      model.kv.numel() * model.kv.element_size() / 2**20, torch.get_num_threads())
 diff --git a/app/lite/cpu/linear.py b/app/lite/cpu/linear.py
-index 7d307dd..867d105 100644
+index 7d307dd..d8f5c09 100644
 --- a/app/lite/cpu/linear.py
 +++ b/app/lite/cpu/linear.py
-@@ -7,7 +7,16 @@ import torch
+@@ -1,13 +1,22 @@
+ """Linear layers on the CPU: int4/int8 GEMV for a few rows, blocked dequant + MKL for prompts."""
+ from __future__ import annotations
+ 
++import os
+ import threading
+ 
+ import torch
  import torch.nn.functional as F
  
  from app.lite.quant import QLinear, unpack_codes
@@ -110,7 +149,6 @@ index 7d307dd..867d105 100644
 +
 +def fallback_dtype() -> torch.dtype:
 +    """Weight dtype of dense layers without native kernels (LITE_CPU_DTYPE: float32, bfloat16, float16)."""
-+    import os
 +
 +    name = os.getenv("LITE_CPU_DTYPE", "float32").strip().lower()
 +    return {"float32": torch.float32, "fp32": torch.float32, "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
@@ -118,22 +156,15 @@ index 7d307dd..867d105 100644
  
  
  class CpuLinear:
-@@ -15,13 +24,29 @@ class CpuLinear:
+@@ -15,13 +24,22 @@ class CpuLinear:
  
      GEMV_MAX_ROWS = 8
  
 -    def __init__(self, q: QLinear):
 +    def __init__(self, q: QLinear, device: torch.device | None = None):
          self.n_out, self.k_in = q.n_out, q.k_in
-+        if device is not None and device.type != "cpu":  # e.g. MPS: dense weights on the device
-+            from app.lite.quant import dequantize_ref
-+
-+            dt = fallback_dtype()
-+            w = q.weight if q.weight is not None else dequantize_ref(
-+                q.codes.cpu(), q.scales.cpu(), q.mins.cpu(), q.spec.bits, q.spec.group, q.k_in)
-+            self.weight = w.to(dt).contiguous().to(device)
-+            self.bias = q.bias.to(dt).to(device) if q.bias is not None else None
-+            self.kind = "f32"
++        if device is not None and device.type != "cpu":  # e.g. MPS
++            self._init_device(q, device)
 +            return
          self.bias = q.bias.float().contiguous() if q.bias is not None else None
          self.kind = "f32"
@@ -150,17 +181,76 @@ index 7d307dd..867d105 100644
              return
          codes = unpack_codes(q.codes.cpu(), bits, q.k_in)  # [N, K] uint8
          scales, mins = q.scales.cpu().float(), q.mins.cpu().float()
-@@ -46,6 +71,7 @@ class CpuLinear:
+@@ -44,8 +62,62 @@ class CpuLinear:
  
+             self.weight = dequantize_ref(q.codes.cpu(), q.scales.cpu(), q.mins.cpu(), bits, group, q.k_in).contiguous()
+ 
++    def _init_device(self, q: QLinear, device: torch.device):
++        """Accelerator (MPS) weights in the LITE_CPU_DTYPE compute dtype: int4 layers stay int4 for
++        torch._weight_int4pack_mm (exactly the bundle's asymmetric group quantization, a quarter of the dense
++        memory traffic); other layers dense. LITE_MPS_INT4=0 makes every layer dense."""
++        dt = fallback_dtype()
++        self.dtype = dt
++        self.bias = q.bias.to(dt).to(device) if q.bias is not None else None
++        self.kind = "f32"
++        bits, group = q.spec.bits, q.spec.group
++        use_int4 = (q.weight is None and bits == 4 and device.type == "mps" and dt != torch.float32
++                    and group in (32, 64, 128, 256) and self.k_in % group == 0 and self.n_out % 8 == 0
++                    and os.getenv("LITE_MPS_INT4", "1").strip().lower() not in ("0", "false", "off", "no"))
++        if use_int4:
++            # MPS int4pack: nibbles packed high-first, dequant (c - 8) * scale + zero, i.e. zero = min + 8 * scale
++            c = unpack_codes(q.codes.cpu(), 4, self.k_in)
++            self.weight = torch._convert_weight_to_int4pack(((c[:, 0::2] << 4) | c[:, 1::2]).contiguous().to(device), 2)
++            sc, mn = q.scales.cpu().float(), q.mins.cpu().float()
++            self.scale_zeros = torch.stack((sc, mn + 8 * sc), -1).transpose(0, 1).contiguous().to(dt).to(device)
++            self.group, self.kind = group, "int4mps"
++            self._q = q
++            return
++        from app.lite.quant import dequantize_ref
++
++        w = q.weight if q.weight is not None else dequantize_ref(
++            q.codes.cpu(), q.scales.cpu(), q.mins.cpu(), bits, group, self.k_in)
++        self.weight = w.to(dt).contiguous().to(device)
++
++    def to_dense(self, dtype: torch.dtype) -> None:
++        """Replace the device weight by a dense `dtype` copy (e.g. fp32 for a layer that overflows fp16)."""
++        dev = self.weight.device
++        if self.kind == "int4mps":
++            from app.lite.quant import dequantize_ref
++
++            q = self._q
++            self.weight = dequantize_ref(q.codes.cpu(), q.scales.cpu(), q.mins.cpu(), 4, q.spec.group, self.k_in)
++            self.kind, self.scale_zeros, self._q = "f32", None, None
++        self.weight = self.weight.to(dtype).contiguous().to(dev)
++        self.bias = self.bias.to(dtype) if self.bias is not None else None
++
++    def mm(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
++        """Device path (dense weight, x already in its dtype): x @ W.T (+ bias) (+ residual) in one kernel."""
++        if self.kind == "int4mps":
++            y = torch._weight_int4pack_mm(x.to(self.dtype), self.weight, self.group, self.scale_zeros)
++            if self.bias is not None:
++                y = y + self.bias
++            return y if residual is None else residual + y
++        if x.dtype != self.weight.dtype:
++            x = x.to(self.weight.dtype)
++        if residual is not None and self.bias is None:
++            return torch.addmm(residual, x, self.weight.t())
++        y = F.linear(x, self.weight, self.bias)
++        return y if residual is None else residual + y
++
      def nbytes(self) -> int:
-         tensors = [getattr(self, a, None) for a in ("weight", "codes", "scales", "mins", "bias")]
+-        tensors = [getattr(self, a, None) for a in ("weight", "codes", "scales", "mins", "bias")]
++        tensors = [getattr(self, a, None) for a in ("weight", "codes", "scales", "mins", "bias", "scale_zeros")]
 +        tensors = [t for t in tensors if isinstance(t, torch.Tensor)]
          return sum(t.numel() * t.element_size() for t in tensors if t is not None)
  
      # Prompt processing dequantizes this many fp32 bytes of rows at a time, so
-@@ -55,6 +81,10 @@ class CpuLinear:
+@@ -54,7 +126,13 @@ class CpuLinear:
+ 
      def __call__(self, x: torch.Tensor, qx=None) -> torch.Tensor:
          """x [M, K] fp32; qx: optional pre-quantized activations for x."""
++        if self.kind == "int4mps":
++            return self.mm(x).float()
          if self.kind == "f32":
 +            if self.weight.dtype != torch.float32:
 +                b = self.bias.to(self.weight.dtype) if self.bias is not None and self.bias.dtype != self.weight.dtype \
@@ -170,7 +260,7 @@ index 7d307dd..867d105 100644
          ext = kernels()
          if x.shape[0] <= self.GEMV_MAX_ROWS:
 diff --git a/app/lite/cpu/model.py b/app/lite/cpu/model.py
-index c5637e3..9c5cf4c 100644
+index c5637e3..25b8254 100644
 --- a/app/lite/cpu/model.py
 +++ b/app/lite/cpu/model.py
 @@ -11,7 +11,7 @@ from app.lite.cpu.linear import CpuLinear
@@ -194,7 +284,7 @@ index c5637e3..9c5cf4c 100644
          self.cfg = ModelConfig.from_dir(path, target_codebook)
          cfg = self.cfg
          self.max_len = max_len
-@@ -45,27 +48,30 @@ class CpuCodebookModel:
+@@ -45,27 +48,98 @@ class CpuCodebookModel:
          else:
              self.embed_audio, self.embed_audio_scale = cw.audio_codes, cw.audio_scale
          self.layers = [{
@@ -223,6 +313,74 @@ index c5637e3..9c5cf4c 100644
          self.seq_pos: list[int] = []
 -        self.decoder = self._make_decoder() if kv_dtype == torch.bfloat16 else None
 +        self.decoder = self._make_decoder() if kv_dtype == torch.bfloat16 and dev.type == "cpu" else None
++        if dev.type != "cpu":
++            self._init_device_step()
++
++    ATTN_BUCKET = 128
++
++    def _init_device_step(self):
++        """Tables for _device_step, the one-token decode on an accelerator (MPS): fp32 residual stream,
++        matmuls and KV cache in the LITE_CPU_DTYPE compute dtype, q/k norms fused (softmax scale folded into
++        the q norm), RoPE from a precomputed table, attention length bucketed. Few kernels per layer and few
++        distinct shapes: on MPS per-kernel and per-shape overheads dominate these small models."""
++        cfg, dev = self.cfg, self.device
++        cd = self.layers[0]["qkv"].dtype
++        self.cdtype = cd
++        # zero-filled: padded attention reads rows past the sequence (masked, but must not be NaN)
++        self.kv = torch.zeros(self.kv.shape, dtype=cd, device=dev)
++        # Additive mask table: _mask[M - end : M - end + B] is 0 for the first `end` rows and -inf after. The
++        # attended length is padded to a multiple of ATTN_BUCKET so MPS sees few distinct shapes (each new
++        # shape costs a graph lookup/compile that dwarfs the attention itself).
++        M = self.kv.shape[3]
++        self._mask = torch.cat((torch.zeros(M), torch.full((M,), float("-inf")))).to(cd).to(dev)
++        nq, nkv, hd = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
++        for L in self.layers:
++            L["qk_norm"] = torch.cat((L["q_norm"].float()[None].expand(nq, hd) * self.scale,
++                                      L["k_norm"].float()[None].expand(nkv, hd))).to(cd).contiguous()
++        if cd == torch.float16:
++            # the last layer's down projection exceeds the fp16 range on some tokens (activations ~1e4+)
++            self.layers[-1]["down"].to_dense(torch.float32)
++        for lin in [L[n] for L in self.layers for n in ("qkv", "o", "gate_up", "down")] + [self.fc1, self.fc2]:
++            lin._q = None  # host codes were only kept for to_dense
++        n_pos = cfg.max_position_embeddings
++        ang = torch.arange(n_pos, dtype=torch.float64)[:, None] * self.inv_freq.cpu().double()[None, :]
++        half = hd // 2
++        self.rope_cos = torch.cat((ang, ang), -1).cos().to(cd).to(dev)
++        sin = ang.sin()
++        self.rope_sin = torch.cat((-sin, sin), -1).to(cd).to(dev)  # rot(x) * sin == flip_halves(x) * signed sin
++        self._half = half
++
++    @torch.inference_mode()
++    def _device_step(self, tok: int, pos: int, t: int) -> torch.Tensor:
++        cfg = self.cfg
++        nq, nkv, hd, eps = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps
++        p = min(max(pos + cfg.layout.chunk_realign_offset, 0), cfg.max_position_embeddings - 1)
++        cos, sin = self.rope_cos[p], self.rope_sin[p]
++        cd = self.cdtype
++        x = self._embed(torch.tensor([tok], dtype=torch.long)).to(self.device)  # fp32 residual stream
++        del self.seq_ids[t:], self.seq_pos[t:]
++        end, rep, nqk = t + 1, nq // nkv, nq + nkv
++        M = self.kv.shape[3]
++        B = min(-(-end // self.ATTN_BUCKET) * self.ATTN_BUCKET, M)
++        mask = self._mask[M - end:M - end + B]
++        for li, L in enumerate(self.layers):
++            h = F.rms_norm(x, (cfg.hidden,), L["in_norm"], eps).to(cd)
++            qkv = L["qkv"].mm(h)[0]
++            qk = F.rms_norm(qkv[:nqk * hd].view(nqk, hd), (hd,), None, eps) * L["qk_norm"]
++            qk = torch.addcmul(qk * cos, qk.view(nqk, 2, self._half).flip(1).view(nqk, hd), sin)
++            kc, vc = self.kv[li, 0], self.kv[li, 1]
++            kc[:, t] = qk[nq:]
++            vc[:, t] = qkv[nqk * hd:].view(nkv, hd)
++            s = torch.baddbmm(mask, qk[:nq].view(nkv, rep, hd), kc[:, :B].transpose(1, 2))  # [nkv, rep, B]
++            a = torch.bmm(torch.softmax(s, dim=-1, dtype=torch.float32).to(cd), vc[:, :B])
++            x = x + L["o"].mm(a.reshape(1, nq * hd)).float()
++            h = F.rms_norm(x, (cfg.hidden,), L["post_norm"], eps).to(cd)
++            g, u = L["gate_up"].mm(h).chunk(2, dim=-1)
++            x = x + L["down"].mm(F.silu(g) * u).float()
++        self.seq_ids.append(tok)
++        self.seq_pos.append(pos)
++        hs = F.rms_norm(x, (cfg.hidden,), self.norm, eps).to(cd)
++        return self.fc2.mm(F.mish(self.fc1.mm(hs)))[0]
  
      def _make_decoder(self):
          """Fused one-token step (app/native/lm_kernels.cpp Decoder) when every layer linear is q4/q8."""
@@ -233,9 +391,12 @@ index c5637e3..9c5cf4c 100644
              return None
          norms = [L[n] for L in self.layers for n in ("in_norm", "post_norm", "q_norm", "k_norm")]
          tensors = []
-@@ -121,15 +127,16 @@ class CpuCodebookModel:
+@@ -120,16 +194,19 @@ class CpuCodebookModel:
+         T = len(ids)
          if T == 1 and self.decoder is not None and not all_hidden:
              return self._step(ids[0], pos[0], start)
++        if T == 1 and self.device.type != "cpu" and not all_hidden:
++            return self._device_step(ids[0], pos[0], start)
          nq, nkv, hd = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
 -        p = (torch.tensor(pos, dtype=torch.float32) + cfg.layout.chunk_realign_offset).clamp(
 +        dev = self.device
@@ -253,7 +414,7 @@ index c5637e3..9c5cf4c 100644
          for li, L in enumerate(self.layers):
              h = _rms(x, L["in_norm"], cfg.rms_eps)
              qkv = L["qkv"](h)
-@@ -141,13 +148,13 @@ class CpuCodebookModel:
+@@ -141,13 +218,13 @@ class CpuCodebookModel:
              kc, vc = self.kv[li, 0], self.kv[li, 1]
              kc[:, start:end] = k.transpose(0, 1).to(kc.dtype)
              vc[:, start:end] = v.view(T, nkv, hd).transpose(0, 1).to(vc.dtype)
@@ -270,7 +431,7 @@ index c5637e3..9c5cf4c 100644
              g, u = L["gate_up"](h, qh_act).chunk(2, dim=-1)
              x = x + L["down"](F.silu(g) * u)
          self.seq_ids.extend(ids)
-@@ -168,14 +175,19 @@ class CpuCodebookModel:
+@@ -168,14 +245,19 @@ class CpuCodebookModel:
          return self.fc2(F.mish(self.fc1(h)))[0]
  
      @staticmethod
@@ -351,8 +512,50 @@ index ea858ee..a377638 100644
          self._encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_AUDIO)
          self._encoder.bitrate = bitrate
  
+diff --git a/app/utils.py b/app/utils.py
+index e46942b..232e0fc 100644
+--- a/app/utils.py
++++ b/app/utils.py
+@@ -37,12 +37,26 @@ class VoicePromptError(ValueError):
+     """The supplied voice reference cannot be used."""
+ 
+ 
++def codec_device() -> str:
++    """Device for the DualCodec decoder and VibeVoice: CUDA when present; the Apple GPU with LITE_DEVICE=mps
++    (MPS_CODECS=0 keeps them on the CPU); else the CPU."""
++    if torch.cuda.is_available():
++        return "cuda"
++    if (os.getenv("LITE_DEVICE", "").strip().lower() == "mps" and torch.backends.mps.is_available()
++            and os.getenv("MPS_CODECS", "1").strip().lower() not in ("0", "false", "off", "no")):
++        return "mps"
++    return "cpu"
++
++
+ def free_memory():
+     gc.collect()
+     if torch.cuda.is_available():
+         torch.cuda.empty_cache()
+         torch.cuda.synchronize()
+-    elif _LIBC is not None:
++        return
++    if torch.backends.mps.is_available() and torch.mps.current_allocated_memory() > 0:
++        torch.mps.empty_cache()  # return cached Metal buffers (decode activations) to the system
++    if _LIBC is not None:
+         _LIBC.malloc_trim(0)  # hand freed heap (encode/decode activations) back to the OS
+ 
+ 
+@@ -184,7 +198,8 @@ def dc_encode(dc_inference, audio: torch.Tensor, n_quantizers: int):
+         ).transpose(1, 2)
+         factor = dc_inference.model.semantic_downsample_factor
+         feat = torch.nn.functional.avg_pool1d(feat, factor, factor)
+-        return dc_inference.model.encode(audio, num_quantizers=n_quantizers, semantic_repr=feat)
++        dev = next(dc_inference.model.parameters()).device  # the codec may sit on MPS (codec_device)
++        return dc_inference.model.encode(audio.to(dev), num_quantizers=n_quantizers, semantic_repr=feat.to(dev))
+ 
+ 
+ def _encode_chunked(
 diff --git a/app/vibevoice_utils.py b/app/vibevoice_utils.py
-index 5fcd4bc..92bf886 100644
+index 5fcd4bc..e79c935 100644
 --- a/app/vibevoice_utils.py
 +++ b/app/vibevoice_utils.py
 @@ -21,7 +21,9 @@ def load_vibevoice_tokenizer(model_path: str, device: str | None = None, cpu_qua
@@ -366,3 +569,18 @@ index 5fcd4bc..92bf886 100644
          try:
              from app.codec.vibevoice_cpu import CpuVibeVoice
  
+@@ -32,7 +34,13 @@ def load_vibevoice_tokenizer(model_path: str, device: str | None = None, cpu_qua
+         except Exception:
+             logger.exception("CPU VibeVoice kernels unavailable; using the reference model in fp32")
+     # Zen 3 / pre-Sapphire-Rapids CPUs have no native bf16 — fp32 wins on CPU.
+-    dtype = torch.bfloat16 if device != "cpu" else torch.float32
++    # MPS: VIBEVOICE_MPS_DTYPE, float16 by default (~56 dB SNR against fp32, half the memory, faster);
++    # float32 or bfloat16 on request.
++    if device == "mps":
++        dtype = {"bfloat16": torch.bfloat16, "bf16": torch.bfloat16, "float32": torch.float32, "fp32": torch.float32
++                 }.get(os.getenv("VIBEVOICE_MPS_DTYPE", "float16").strip().lower(), torch.float16)
++    else:
++        dtype = torch.bfloat16 if device != "cpu" else torch.float32
+     tokenizer = VibeVoiceAcousticTokenizerModel.from_pretrained(
+         model_path, dtype=dtype,
+     )
