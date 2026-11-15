@@ -469,8 +469,18 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                 managed_status = gr.Markdown(manager.status_markdown())
             with gr.Accordion("Eingebauter Server", open=False):
                 with gr.Row():
+                    device_choice = gr.Dropdown(
+                        [(label, key) for key, label in manager.DEVICE_LABELS.items()],
+                        value=manager.device,
+                        label="Rechenwerk (gilt nach Neustart)",
+                        scale=2,
+                    )
                     dtype_choice = gr.Dropdown(
-                        [("bfloat16 – halber Speicherbedarf", "bfloat16"), ("float32 – höchste Genauigkeit", "float32")],
+                        [
+                            ("bfloat16 – empfohlen", "bfloat16"),
+                            ("float16", "float16"),
+                            ("float32 – höchste Genauigkeit, doppelter Speicher", "float32"),
+                        ],
                         value=manager.dtype,
                         label="Rechengenauigkeit (gilt nach Neustart)",
                         scale=2,
@@ -750,11 +760,11 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                 show_progress="hidden",
             )
 
-            def do_restart(dtype):
-                threading.Thread(target=manager.restart, kwargs={"dtype": dtype}, daemon=True).start()
+            def do_restart(device, dtype):
+                threading.Thread(target=manager.restart, kwargs={"dtype": dtype, "device": device}, daemon=True).start()
                 return False
 
-            restart_btn.click(do_restart, dtype_choice, connected_state)
+            restart_btn.click(do_restart, [device_choice, dtype_choice], connected_state)
             reinstall_btn.click(
                 lambda: (threading.Thread(target=manager.reinstall, daemon=True).start(), False)[1],
                 None,

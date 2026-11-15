@@ -53,6 +53,13 @@ def default_home() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "TontaubeTTS"
 
 
+def default_device() -> str:
+    """Metal (MPS) auf Apple Silicon, sonst CPU."""
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        return "mps"
+    return "cpu"
+
+
 def _free_port(preferred: int) -> int:
     for port in [preferred, *range(preferred + 1, preferred + 50)]:
         with socket.socket() as s:
@@ -104,7 +111,10 @@ class ServerManager:
         "stopped": "⚪ Gestoppt",
     }
 
-    def __init__(self, home: Path | None = None, port: int = 8080, dtype: str | None = None):
+    DEVICE_LABELS = {"mps": "Apple-GPU (Metal)", "cpu": "CPU"}
+
+    def __init__(self, home: Path | None = None, port: int = 8080, dtype: str | None = None,
+                 device: str | None = None):
         self.home = (home or default_home()).resolve()
         self.src = self.home / f"server-{SERVER_VERSION}"
         self.venv = self.home / "server-venv"
@@ -112,6 +122,8 @@ class ServerManager:
         self.log_file = self.logs / "server.log"
         self.preferred_port = port
         self.dtype = dtype or os.environ.get("LITE_CPU_DTYPE", "bfloat16")
+        self.device = device or os.environ.get("LITE_DEVICE") or default_device()
+        self._fell_back = False
         self.state = ServerState()
         self.proc: subprocess.Popen | None = None
         self._lines: deque[str] = deque(maxlen=400)
@@ -177,7 +189,10 @@ class ServerManager:
         if s.detail:
             lines.append(s.detail)
         if s.url and s.phase == "ready":
-            lines.append(f"Server: `{s.url}` · Rechengenauigkeit: `{self.dtype}`")
+            lines.append(
+                f"Server: `{s.url}` · Rechenwerk: {self.DEVICE_LABELS.get(self.device, self.device)} · "
+                f"Genauigkeit: `{self.dtype}`"
+            )
         return "\n\n".join(lines)
 
     @property
@@ -193,12 +208,15 @@ class ServerManager:
         self._thread = threading.Thread(target=self._run, name="tontaube-server-manager", daemon=True)
         self._thread.start()
 
-    def restart(self, dtype: str | None = None) -> None:
+    def restart(self, dtype: str | None = None, device: str | None = None) -> None:
         self.stop()
         if self._thread:
             self._thread.join(timeout=15)
         if dtype:
             self.dtype = dtype
+        if device:
+            self.device = device
+            self._fell_back = False
         self.start()
 
     def reinstall(self) -> None:
@@ -236,7 +254,16 @@ class ServerManager:
             if self._stop.is_set():
                 return
             self._start_server(tools_path)
-            self._wait_ready()
+            try:
+                self._wait_ready()
+            except RuntimeError:
+                if self.device != "mps" or self._stop.is_set():
+                    raise
+                # Metal-Pfad gescheitert: einmal automatisch auf der CPU versuchen.
+                self._log("Start auf der Apple-GPU fehlgeschlagen, versuche es auf der CPU …")
+                self.device, self._fell_back = "cpu", True
+                self._start_server(tools_path)
+                self._wait_ready()
         except Exception as exc:  # noqa: BLE001 - alles soll in der GUI landen
             self._set("error", "Einrichtung oder Start fehlgeschlagen.", f"`{type(exc).__name__}: {exc}`", None)
 
@@ -325,7 +352,8 @@ class ServerManager:
         env.update(
             {
                 "TTS_BACKEND": "lite",
-                "LITE_DEVICE": "cpu",
+                "LITE_DEVICE": self.device,
+                "PYTORCH_ENABLE_MPS_FALLBACK": "1",
                 "LITE_CPU_DTYPE": self.dtype,
                 "TTS_HOST": "127.0.0.1",
                 "TTS_PORT": str(port),
@@ -371,7 +399,8 @@ class ServerManager:
                 r = requests.get(self.state.url + "/readyz", timeout=3)
                 if r.ok:
                     secs = int(time.time() - self.state.started_at)
-                    self._set("ready", f"Server bereit (Start in {secs // 60}:{secs % 60:02d} min).", "", None)
+                    note = " Die Apple-GPU ließ sich nicht nutzen, er läuft auf der CPU." if self._fell_back else ""
+                    self._set("ready", f"Server bereit (Start in {secs // 60}:{secs % 60:02d} min).{note}", "", None)
                     return
             except requests.RequestException:
                 pass
