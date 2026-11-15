@@ -1,5 +1,44 @@
+diff --git a/app/config.py b/app/config.py
+index 81a5f0a..7461f5c 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -39,7 +39,7 @@ def _lite_on_cpu() -> bool:
+         return False
+     device = os.getenv("LITE_DEVICE", "").strip().lower()
+     if device:
+-        return device == "cpu"
++        return device in ("cpu", "mps")
+     try:
+         import torch
+ 
+diff --git a/app/lite/__init__.py b/app/lite/__init__.py
+index 0ae48ce..4661aaa 100644
+--- a/app/lite/__init__.py
++++ b/app/lite/__init__.py
+@@ -29,8 +29,10 @@ logger = get_logger("lite")
+ def lite_device() -> str:
+     """LITE_DEVICE (cuda/cpu); defaults to the GPU when one is available."""
+     device = os.getenv("LITE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").strip().lower()
+-    if device not in ("cuda", "cpu"):
+-        raise ValueError(f"unsupported LITE_DEVICE {device!r}; expected 'cuda' or 'cpu'")
++    if device not in ("cuda", "cpu", "mps"):
++        raise ValueError(f"unsupported LITE_DEVICE {device!r}; expected 'cuda', 'cpu' or 'mps'")
++    if device == "mps" and not torch.backends.mps.is_available():
++        raise RuntimeError("LITE_DEVICE=mps but the Metal (MPS) backend is not available")
+     if device == "cuda" and not torch.cuda.is_available():
+         raise RuntimeError("LITE_DEVICE=cuda but no CUDA GPU is available")
+     return device
+@@ -53,7 +55,7 @@ def build_codebook_engines(config, model_paths: list[str], text_rows: list[list[
+         logger.info("Loading pre-quantized lite bundle from %s", bundle)
+     else:
+         plans = parse_codebook_plans(quant, len(model_paths))
+-    if lite_device() == "cpu":
++    if lite_device() in ("cpu", "mps"):  # mps: the CPU engine's plain-torch model on the Apple GPU
+         from app.lite.cpu.engine import build_cpu_engines
+ 
+         return build_cpu_engines(config, model_paths, plans, bundle, text_rows)
 diff --git a/app/lite/cpu/engine.py b/app/lite/cpu/engine.py
-index e86dc34..21a7cd9 100644
+index e86dc34..5c96c1e 100644
 --- a/app/lite/cpu/engine.py
 +++ b/app/lite/cpu/engine.py
 @@ -14,7 +14,7 @@ from app.lite.cpu.model import CpuCodebookModel
@@ -11,20 +50,54 @@ index e86dc34..21a7cd9 100644
  
  logger = get_logger("lite")
  
-@@ -141,7 +141,10 @@ def build_cpu_engines(config, model_paths: list[str], plans, bundle,
+@@ -117,7 +117,7 @@ class CpuEngine:
+             reuse, offset = m.reusable_prefix(ids, pos)
+             if reuse:
+                 logger.debug("%s: reusing %d of %d prompt tokens from the KV cache", self.name, reuse, n)
+-            logits = m.forward(ids[reuse:], [p + offset for p in pos[reuse:]], reuse)
++            logits = m.forward(ids[reuse:], [p + offset for p in pos[reuse:]], reuse).float().cpu()
+         out: list[int] = []
+         while True:
+             tok = sample(logits[None].clone(), [seq], [len(out)])
+@@ -132,7 +132,7 @@ class CpuEngine:
+                 return
+             t = n + len(out) - 1  # sequence index of the fed token
+             with _EXEC_LOCK:
+-                logits = m.forward([gid], [t + offset], t)
++                logits = m.forward([gid], [t + offset], t).float().cpu()
+ 
+ 
+ def build_cpu_engines(config, model_paths: list[str], plans, bundle,
+@@ -141,7 +141,16 @@ def build_cpu_engines(config, model_paths: list[str], plans, bundle,
      from app.lite.weights import LazyWeights, load_bundle
  
      torch.set_num_threads(int(os.getenv("LITE_CPU_THREADS", str(torch.get_num_threads()))))
 -    kernels()
-+    if native_available():
++    from app.lite import lite_device
++
++    device = torch.device(lite_device())
++    if device.type == "mps":
++        logger.info("Lite codebook models on the Apple GPU (MPS), %s weights",
++                    __import__('app.lite.cpu.linear', fromlist=['x']).fallback_dtype())
++    elif native_available():
 +        kernels()
 +    else:
 +        logger.info("No AVX2 kernels on this CPU: dense %s weights with plain torch ops", __import__('app.lite.cpu.linear', fromlist=['x']).fallback_dtype())
      engines = []
      for cb, path in enumerate(model_paths):
          prequant = None
+@@ -152,7 +161,8 @@ def build_cpu_engines(config, model_paths: list[str], plans, bundle,
+             plan = plans[cb]
+         model = CpuCodebookModel(path, cb, plan, max_len=config.max_model_len_per_cb[cb],
+                                  weights=LazyWeights(Path(path) / "model.safetensors", mmap=True),
+-                                 prequant=prequant, text_rows=text_rows[cb] if text_rows else None)
++                                 prequant=prequant, text_rows=text_rows[cb] if text_rows else None,
++                                 device=device)
+         logger.info("CB%d lite CPU model: %s; weights %.0f MiB, KV cache %.0f MiB (%d threads)",
+                     cb, plan.describe(), model.weight_bytes() / 2**20,
+                     model.kv.numel() * model.kv.element_size() / 2**20, torch.get_num_threads())
 diff --git a/app/lite/cpu/linear.py b/app/lite/cpu/linear.py
-index 7d307dd..8b3d0bd 100644
+index 7d307dd..867d105 100644
 --- a/app/lite/cpu/linear.py
 +++ b/app/lite/cpu/linear.py
 @@ -7,7 +7,16 @@ import torch
@@ -45,7 +118,24 @@ index 7d307dd..8b3d0bd 100644
  
  
  class CpuLinear:
-@@ -21,7 +30,13 @@ class CpuLinear:
+@@ -15,13 +24,29 @@ class CpuLinear:
+ 
+     GEMV_MAX_ROWS = 8
+ 
+-    def __init__(self, q: QLinear):
++    def __init__(self, q: QLinear, device: torch.device | None = None):
+         self.n_out, self.k_in = q.n_out, q.k_in
++        if device is not None and device.type != "cpu":  # e.g. MPS: dense weights on the device
++            from app.lite.quant import dequantize_ref
++
++            dt = fallback_dtype()
++            w = q.weight if q.weight is not None else dequantize_ref(
++                q.codes.cpu(), q.scales.cpu(), q.mins.cpu(), q.spec.bits, q.spec.group, q.k_in)
++            self.weight = w.to(dt).contiguous().to(device)
++            self.bias = q.bias.to(dt).to(device) if q.bias is not None else None
++            self.kind = "f32"
++            return
+         self.bias = q.bias.float().contiguous() if q.bias is not None else None
          self.kind = "f32"
          bits, group = q.spec.bits, q.spec.group
          if q.weight is not None:
@@ -60,18 +150,27 @@ index 7d307dd..8b3d0bd 100644
              return
          codes = unpack_codes(q.codes.cpu(), bits, q.k_in)  # [N, K] uint8
          scales, mins = q.scales.cpu().float(), q.mins.cpu().float()
-@@ -55,6 +70,9 @@ class CpuLinear:
+@@ -46,6 +71,7 @@ class CpuLinear:
+ 
+     def nbytes(self) -> int:
+         tensors = [getattr(self, a, None) for a in ("weight", "codes", "scales", "mins", "bias")]
++        tensors = [t for t in tensors if isinstance(t, torch.Tensor)]
+         return sum(t.numel() * t.element_size() for t in tensors if t is not None)
+ 
+     # Prompt processing dequantizes this many fp32 bytes of rows at a time, so
+@@ -55,6 +81,10 @@ class CpuLinear:
      def __call__(self, x: torch.Tensor, qx=None) -> torch.Tensor:
          """x [M, K] fp32; qx: optional pre-quantized activations for x."""
          if self.kind == "f32":
 +            if self.weight.dtype != torch.float32:
-+                b = self.bias.to(self.weight.dtype) if self.bias is not None else None
++                b = self.bias.to(self.weight.dtype) if self.bias is not None and self.bias.dtype != self.weight.dtype \
++                    else self.bias
 +                return F.linear(x.to(self.weight.dtype), self.weight, b).float()
              return F.linear(x, self.weight, self.bias)
          ext = kernels()
          if x.shape[0] <= self.GEMV_MAX_ROWS:
 diff --git a/app/lite/cpu/model.py b/app/lite/cpu/model.py
-index c5637e3..cf0d49d 100644
+index c5637e3..9c5cf4c 100644
 --- a/app/lite/cpu/model.py
 +++ b/app/lite/cpu/model.py
 @@ -11,7 +11,7 @@ from app.lite.cpu.linear import CpuLinear
@@ -83,7 +182,49 @@ index c5637e3..cf0d49d 100644
  
  
  def _rms(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-@@ -65,7 +65,7 @@ class CpuCodebookModel:
+@@ -28,7 +28,10 @@ class CpuCodebookModel:
+ 
+     def __init__(self, path, target_codebook: int, plan: QuantPlan, max_len: int,
+                  weights=None, prequant: dict[str, QLinear] | None = None,
+-                 kv_dtype: torch.dtype = torch.bfloat16, text_rows: list[int] | None = None):
++                 kv_dtype: torch.dtype = torch.bfloat16, text_rows: list[int] | None = None,
++                 device: torch.device | None = None):
++        self.device = torch.device(device) if device is not None else torch.device("cpu")
++        dev = self.device
+         self.cfg = ModelConfig.from_dir(path, target_codebook)
+         cfg = self.cfg
+         self.max_len = max_len
+@@ -45,27 +48,30 @@ class CpuCodebookModel:
+         else:
+             self.embed_audio, self.embed_audio_scale = cw.audio_codes, cw.audio_scale
+         self.layers = [{
+-            "in_norm": L.in_norm.float(), "post_norm": L.post_norm.float(),
+-            "q_norm": L.q_norm.float(), "k_norm": L.k_norm.float(),
+-            "qkv": CpuLinear(L.qkv), "o": CpuLinear(L.o), "gate_up": CpuLinear(L.gate_up), "down": CpuLinear(L.down),
++            "in_norm": L.in_norm.float().to(dev), "post_norm": L.post_norm.float().to(dev),
++            "q_norm": L.q_norm.float().to(dev), "k_norm": L.k_norm.float().to(dev),
++            "qkv": CpuLinear(L.qkv, dev), "o": CpuLinear(L.o, dev), "gate_up": CpuLinear(L.gate_up, dev),
++            "down": CpuLinear(L.down, dev),
+         } for L in cw.layers]
+-        self.norm = cw.norm.float()
+-        self.fc1, self.fc2 = CpuLinear(cw.fc1), CpuLinear(cw.fc2)
++        self.norm = cw.norm.float().to(dev)
++        self.fc1, self.fc2 = CpuLinear(cw.fc1, dev), CpuLinear(cw.fc2, dev)
+         self.inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.head_dim, 2, dtype=torch.float32) / cfg.head_dim))
++        self.inv_freq = self.inv_freq.to(dev)
+         self.scale = cfg.head_dim ** -0.5
+         # KV cache [layer][k|v][kv_head][position][head_dim]: per-head rows contiguous.
+         # Uninitialized: rows are only read after being written, so pages commit lazily.
+-        self.kv = torch.empty((cfg.n_layers, 2, cfg.n_kv_heads, max_len + 1, cfg.head_dim), dtype=kv_dtype)
++        self.kv = torch.empty((cfg.n_layers, 2, cfg.n_kv_heads, max_len + 1, cfg.head_dim), dtype=kv_dtype,
++                              device=dev)
+         # Tokens and positions whose KV the cache currently holds (prefix reuse).
+         self.seq_ids: list[int] = []
+         self.seq_pos: list[int] = []
+-        self.decoder = self._make_decoder() if kv_dtype == torch.bfloat16 else None
++        self.decoder = self._make_decoder() if kv_dtype == torch.bfloat16 and dev.type == "cpu" else None
+ 
+     def _make_decoder(self):
          """Fused one-token step (app/native/lm_kernels.cpp Decoder) when every layer linear is q4/q8."""
          cfg = self.cfg
          lins = [L[n] for L in self.layers for n in ("qkv", "o", "gate_up", "down")]
@@ -92,16 +233,27 @@ index c5637e3..cf0d49d 100644
              return None
          norms = [L[n] for L in self.layers for n in ("in_norm", "post_norm", "q_norm", "k_norm")]
          tensors = []
-@@ -129,7 +129,7 @@ class CpuCodebookModel:
-         x = self._embed(torch.tensor(ids, dtype=torch.long))
+@@ -121,15 +127,16 @@ class CpuCodebookModel:
+         if T == 1 and self.decoder is not None and not all_hidden:
+             return self._step(ids[0], pos[0], start)
+         nq, nkv, hd = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
+-        p = (torch.tensor(pos, dtype=torch.float32) + cfg.layout.chunk_realign_offset).clamp(
++        dev = self.device
++        p = (torch.tensor(pos, dtype=torch.float32, device=dev) + cfg.layout.chunk_realign_offset).clamp(
+             0, cfg.max_position_embeddings - 1)
+         ang = p[:, None] * self.inv_freq[None, :]
+         emb = torch.cat((ang, ang), dim=-1)
+         cos, sin = emb.cos()[:, None, :], emb.sin()[:, None, :]
+-        x = self._embed(torch.tensor(ids, dtype=torch.long))
++        x = self._embed(torch.tensor(ids, dtype=torch.long)).to(dev)
          end = start + T
          del self.seq_ids[start:], self.seq_pos[start:]
 -        ext = kernels()
-+        ext = kernels() if native_available() else None
++        ext = kernels() if native_available() and dev.type == "cpu" else None
          for li, L in enumerate(self.layers):
              h = _rms(x, L["in_norm"], cfg.rms_eps)
              qkv = L["qkv"](h)
-@@ -141,13 +141,13 @@ class CpuCodebookModel:
+@@ -141,13 +148,13 @@ class CpuCodebookModel:
              kc, vc = self.kv[li, 0], self.kv[li, 1]
              kc[:, start:end] = k.transpose(0, 1).to(kc.dtype)
              vc[:, start:end] = v.view(T, nkv, hd).transpose(0, 1).to(vc.dtype)
@@ -109,7 +261,8 @@ index c5637e3..cf0d49d 100644
 +            if ext is not None and T == 1 and hd == 128 and kc.dtype == torch.bfloat16:
                  a = ext.decode_attn(q[0], kc, vc, end, self.scale)[None]
              else:
-                 a = self._attend(q, kc, vc, start, end).reshape(T, nq * hd)
+-                a = self._attend(q, kc, vc, start, end).reshape(T, nq * hd)
++                a = self._attend(q, kc, vc, start, end, dev).reshape(T, nq * hd)
              x = x + L["o"](a)
              h = _rms(x, L["post_norm"], cfg.rms_eps)
 -            qh_act = ext.quantize_act(h) if T <= CpuLinear.GEMV_MAX_ROWS else None
@@ -117,6 +270,31 @@ index c5637e3..cf0d49d 100644
              g, u = L["gate_up"](h, qh_act).chunk(2, dim=-1)
              x = x + L["down"](F.silu(g) * u)
          self.seq_ids.extend(ids)
+@@ -168,14 +175,19 @@ class CpuCodebookModel:
+         return self.fc2(F.mish(self.fc1(h)))[0]
+ 
+     @staticmethod
+-    def _attend(q, kc, vc, start, end):
++    def _attend(q, kc, vc, start, end, device=None):
+         """New tokens start..end-1 over the cache (fp32 from the bf16 cache, as in decode)."""
+         T = end - start
+         qh, kh, vh = q.transpose(0, 1)[None], kc[None, :, :end].float(), vc[None, :, :end].float()
++        gqa = {"enable_gqa": True}
++        if qh.device.type == "mps" and kh.shape[1] != qh.shape[1]:  # expand KV heads explicitly on MPS
++            rep = qh.shape[1] // kh.shape[1]
++            kh, vh = kh.repeat_interleave(rep, dim=1), vh.repeat_interleave(rep, dim=1)
++            gqa = {}
+         if start == 0:
+-            a = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, enable_gqa=True)
++            a = F.scaled_dot_product_attention(qh, kh, vh, is_causal=T > 1, **gqa)
+         else:  # causal within the new block, full view of the cached prefix
+-            mask = torch.ones((T, end), dtype=torch.bool)
+-            mask[:, start:] = torch.tril(torch.ones((T, T), dtype=torch.bool))
+-            a = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask, enable_gqa=True)
++            mask = torch.ones((T, end), dtype=torch.bool, device=qh.device)
++            mask[:, start:] = torch.tril(torch.ones((T, T), dtype=torch.bool, device=qh.device))
++            a = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask, **gqa)
+         return a[0].transpose(0, 1)
 diff --git a/app/native/__init__.py b/app/native/__init__.py
 index ffeebd4..84f3c30 100644
 --- a/app/native/__init__.py
