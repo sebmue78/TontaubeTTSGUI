@@ -119,7 +119,7 @@ class SegmentDataSource(
             dest.parentFile?.mkdirs()
             target = dest
             // Eigene Temp-Datei je Quelle: parallele (abgebrochene) Ladevorgänge stören sich nicht
-            tmpFile = File.createTempFile(dest.nameWithoutExtension + "-", ".part", dest.parentFile).also { tmpOut = FileOutputStream(it) }
+            tmpFile = File.createTempFile("seg-" + dest.nameWithoutExtension + "-", ".part", dest.parentFile).also { tmpOut = FileOutputStream(it) }
         }
         opened = true
         transferStarted(dataSpec)
