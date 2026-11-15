@@ -3,7 +3,9 @@ name: macOS-App bauen
 on:
   push:
     branches: [main, macos-app]
-    paths-ignore: ["**.md", "docs/**"]
+    paths-ignore: ["**.md", "docs/**", "android/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "android/**"]
   workflow_dispatch:
 
 permissions:
@@ -52,6 +54,7 @@ jobs:
           path: dist/Tontaube-TTS.dmg
 
       - name: Als Release "macos-latest" veröffentlichen
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
