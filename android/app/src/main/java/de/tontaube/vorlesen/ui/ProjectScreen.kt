@@ -107,11 +107,12 @@ fun ProjectScreen(projectId: Long, snackbar: SnackbarHostState, onBack: () -> Un
     LaunchedEffect(currentIndex, text, follow) {
         if (text != null && follow) list.animateScrollToItem(currentIndex.coerceAtLeast(0), scrollOffset = -120)
     }
-    val currentVisible by remember {
+    val currentVisible by remember(currentIndex) {
         derivedStateOf { list.layoutInfo.visibleItemsInfo.any { it.index == currentIndex } }
     }
-    LaunchedEffect(list.isScrollInProgress) {
-        if (list.isScrollInProgress) follow = false
+    // Nur echtes Wischen durch den Nutzer beendet das Mitlaufen (nicht das automatische Scrollen)
+    LaunchedEffect(list) {
+        list.interactionSource.interactions.collect { if (it is androidx.compose.foundation.interaction.DragInteraction.Start) follow = false }
     }
 
     Scaffold(
@@ -153,7 +154,7 @@ fun ProjectScreen(projectId: Long, snackbar: SnackbarHostState, onBack: () -> Un
                 speed = if (isCurrent) playback.speed else TtsSettings.decode(project?.settingsJson).playbackSpeed,
                 onStart = { follow = true; engine.open(projectId) },
                 onSeekSegment = { follow = true; if (isCurrent) engine.seekToSegment(it) else engine.open(projectId, it) },
-                onSpeed = { engine.setSpeed(it) },
+                onSpeed = { engine.setSpeed(projectId, it) },
                 onOpenSettings = onOpenSettings,
             )
         },

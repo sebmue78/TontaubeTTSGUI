@@ -99,6 +99,7 @@ class ProjectRepository(
     suspend fun importText(title: String, body: String): Long = withContext(Dispatchers.IO) {
         val doc = parser.parse(body.toByteArray(), "$title.txt", "text/plain")
         val text = segmenter.segment(doc)
+        if (text.segments.isEmpty()) throw DocumentException("Der Text enthält nichts Vorlesbares.")
         val id = dao.insert(
             ProjectEntity(
                 title = title.take(200), author = null, format = doc.format.name, sourceName = null,

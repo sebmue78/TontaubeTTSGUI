@@ -69,6 +69,11 @@ class SegmentDataSource(
 
     override fun getUri(): Uri? = uri
 
+    /** Laufende Server-Anfrage sofort abbrechen (Socket-Lesen reagiert nicht auf Thread-Unterbrechung). */
+    fun cancel() {
+        call?.cancel()
+    }
+
     override fun open(dataSpec: DataSpec): Long {
         uri = dataSpec.uri
         transferInitializing(dataSpec)
@@ -113,7 +118,8 @@ class SegmentDataSource(
         src.cacheFile?.let { dest ->
             dest.parentFile?.mkdirs()
             target = dest
-            tmpFile = File(dest.parentFile, dest.name + ".part").also { tmpOut = FileOutputStream(it) }
+            // Eigene Temp-Datei je Quelle: parallele (abgebrochene) Ladevorgänge stören sich nicht
+            tmpFile = File.createTempFile(dest.nameWithoutExtension + "-", ".part", dest.parentFile).also { tmpOut = FileOutputStream(it) }
         }
         opened = true
         transferStarted(dataSpec)
@@ -183,7 +189,7 @@ class SegmentDataSource(
             tmpOut = null
             val dest = target
             val tmp = tmpFile
-            if (dest != null && tmp != null && !tmp.renameTo(dest)) tmp.delete()
+            if (dest != null && tmp != null && (dest.exists() || !tmp.renameTo(dest))) tmp.delete()
             tmpFile = null
         }
     }
@@ -215,6 +221,14 @@ class SegmentDataSource(
 
     @UnstableApi
     class Factory(private val api: TontaubeApi, private val resolver: SegmentResolver) : DataSource.Factory {
-        override fun createDataSource(): DataSource = SegmentDataSource(api, resolver)
+        private val active = java.util.Collections.newSetFromMap(java.util.WeakHashMap<SegmentDataSource, Boolean>())
+
+        override fun createDataSource(): DataSource = SegmentDataSource(api, resolver).also { synchronized(active) { active += it } }
+
+        /** Alle laufenden Streams abbrechen (z. B. beim Springen an eine andere Stelle). */
+        fun cancelAll() {
+            val list = synchronized(active) { active.toList() }
+            list.forEach { it.cancel() }
+        }
     }
 }

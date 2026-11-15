@@ -89,7 +89,7 @@ class VoiceRepository(private val context: Context, db: AppDatabase) {
             if (duration in 1 until MIN_MS) throw VoiceException("Die Aufnahme ist zu kurz (${duration / 1000} s). Bitte mindestens 5 Sekunden.")
             val bytes = source.readBytes()
             val fp = MessageDigest.getInstance("SHA-1").digest(bytes).joinToString("") { "%02x".format(it) }.take(16)
-            val fileName = "voice-$fp.${source.extension.ifEmpty { "audio" }}"
+            val fileName = "voice-$fp-${System.currentTimeMillis()}.${source.extension.ifEmpty { "audio" }}"
             val target = File(dir, fileName)
             if (source.absolutePath != target.absolutePath) {
                 source.copyTo(target, overwrite = true)

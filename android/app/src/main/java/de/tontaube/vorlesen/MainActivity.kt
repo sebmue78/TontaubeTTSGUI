@@ -32,7 +32,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val container = (application as TontaubeApp).container
-        handleIntent(intent)
+        if (savedInstanceState == null) handleIntent(intent)
         setContent {
             val theme by container.prefs.theme.collectAsStateWithLifecycle("system")
             CompositionLocalProvider(LocalContainer provides container) {

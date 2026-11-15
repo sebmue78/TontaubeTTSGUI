@@ -84,7 +84,7 @@ class PlaybackEngine(
     private val dataSourceFactory = SegmentDataSource.Factory(api, resolver)
 
     private val extractors = ExtractorsFactory {
-        arrayOf<Extractor>(Mp3Extractor(Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING_ALWAYS))
+        arrayOf<Extractor>(Mp3Extractor(Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING))
     }
 
     private val errorPolicy = object : DefaultLoadErrorHandlingPolicy(2) {
@@ -187,9 +187,13 @@ class PlaybackEngine(
                 _state.update { s -> s.copy(error = "Der Text des Projekts konnte nicht geladen werden.") }
                 return@launch
             }
+            if (t.segments.isEmpty()) {
+                _state.update { s -> s.copy(error = "Das Projekt enthält keinen vorlesbaren Text.") }
+                return@launch
+            }
             project = p
             text = t
-            val index = (segmentIndex ?: p.segmentIndex).coerceIn(0, (t.segments.size - 1).coerceAtLeast(0))
+            val index = (segmentIndex ?: p.segmentIndex).coerceIn(0, t.segments.size - 1)
             val pos = if (segmentIndex == null) positionMs ?: p.positionMs else positionMs ?: 0L
             val restart = p.finished && segmentIndex == null
             stopSample()
@@ -271,14 +275,23 @@ class PlaybackEngine(
         }
     }
 
-    fun setSpeed(speed: Float) {
-        player.setPlaybackSpeed(speed)
-        val p = project ?: return
+    /** Wiedergabe-Tempo eines Projekts ändern (gilt sofort, wenn es gerade geöffnet ist). */
+    fun setSpeed(projectId: Long, speed: Float) {
+        val isCurrent = project?.id == projectId
+        if (isCurrent) player.setPlaybackSpeed(speed)
         scope.launch {
-            val s = TtsSettings.decode(projects.get(p.id)?.settingsJson).copy(playbackSpeed = speed)
-            projects.updateSettings(p.id, s)
-            project = projects.get(p.id)
+            val s = TtsSettings.decode(projects.get(projectId)?.settingsJson).copy(playbackSpeed = speed)
+            projects.updateSettings(projectId, s)
+            if (project?.id == projectId) project = projects.get(projectId)
         }
+    }
+
+    /** Für die Benachrichtigung: nach dem Ende von vorn beginnen, nach einem Fehler neu ansetzen. */
+    fun restartIfEnded(): Boolean {
+        if (player.playbackState == Player.STATE_ENDED && project != null) {
+            loadWindow(0, 0, true); return true
+        }
+        return false
     }
 
     /** Einstellungen eines Projekts wurden geändert: falls es gerade läuft, mit den neuen Einstellungen fortfahren. */
@@ -301,6 +314,8 @@ class PlaybackEngine(
     /** Projekt wurde gelöscht. */
     fun onProjectDeleted(projectId: Long) {
         if (project?.id != projectId) return
+        windowJob?.cancel()
+        dataSourceFactory.cancelAll()
         player.stop()
         player.clearMediaItems()
         project = null
@@ -316,17 +331,21 @@ class PlaybackEngine(
     // -- Hörprobe -------------------------------------------------------------------------------
 
     /** Kurze Hörprobe mit den angegebenen Einstellungen (z. B. beim Einstellen einer Stimme). */
+    private var sampleJob: Job? = null
+
     fun playSample(sampleText: String, settings: TtsSettings) {
         player.pause()
+        sampleJob?.cancel()
         val id = sampleIds.incrementAndGet()
         _sample.value = SampleState(loading = true)
-        scope.launch {
+        sampleJob = scope.launch {
             val body = try {
                 withContext(Dispatchers.IO) { TtsRequest.build(sampleText, settings, voices.audioB64Blocking(settings.voice)) }
             } catch (e: Exception) {
                 _sample.value = SampleState(error = e.message)
                 return@launch
             }
+            if (sampleIds.get() != id) return@launch
             samples.clear()
             samples[id] = body
             samplePlayer.setMediaItem(
@@ -338,22 +357,37 @@ class PlaybackEngine(
     }
 
     fun stopSample() {
+        sampleJob?.cancel()
+        sampleJob = null
         if (samplePlayer.playbackState != Player.STATE_IDLE) samplePlayer.stop()
         _sample.value = SampleState()
     }
 
     // -- intern ---------------------------------------------------------------------------------
 
+    private var windowJob: Job? = null
+
     private fun loadWindow(index: Int, positionMs: Long, play: Boolean) {
         val p = project ?: return
         val t = text ?: return
         if (t.segments.isEmpty()) return
+        windowJob?.cancel()
+        windowJob = scope.launch {
+            // Datenbankzugriff (Fingerabdruck eigener Stimmen) nicht auf dem Hauptthread
+            val cached = withContext(Dispatchers.IO) { projects.segmentFile(p, index).exists() }
+            if (project?.id != p.id) return@launch
+            applyWindow(p, t, index, if (cached) positionMs else 0, play)
+        }
+    }
+
+    private fun applyWindow(p: ProjectEntity, t: SegmentedText, index: Int, positionMs: Long, play: Boolean) {
         val settings = TtsSettings.decode(p.settingsJson)
         val items = (index..minOf(index + AHEAD, t.segments.size - 1)).map { mediaItem(p, t, it) }
-        val cached = projects.segmentFile(p, index).exists()
+        // Laufende Erzeugungen des alten Fensters abbrechen, damit der Server frei wird
+        dataSourceFactory.cancelAll()
         _state.update { it.copy(error = null, finished = false) }
         player.setPlaybackSpeed(settings.playbackSpeed)
-        player.setMediaItems(items, 0, if (cached) positionMs else 0)
+        player.setMediaItems(items, 0, positionMs)
         player.prepare()
         player.playWhenReady = play
         onSegmentChanged(index)

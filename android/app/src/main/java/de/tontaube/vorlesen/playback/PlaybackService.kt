@@ -37,6 +37,12 @@ class PlaybackService : MediaSessionService() {
             override fun seekBack() = engine.skip(-PlaybackEngine.SKIP_MS)
             override fun seekForward() = engine.skip(PlaybackEngine.SKIP_MS)
             override fun play() = engine.resume()
+            override fun seekToDefaultPosition() {
+                if (!engine.restartIfEnded()) super.seekToDefaultPosition()
+            }
+            override fun prepare() {
+                if (engine.player.playerError != null) engine.retry() else super.prepare()
+            }
         }
         val open = PendingIntent.getActivity(
             this, 0,

@@ -179,8 +179,11 @@ fun LibraryScreen(
         PasteTextDialog(onDismiss = { pasteOpen = false }) { title, text ->
             pasteOpen = false
             scope.launch {
-                val id = container.projects.importText(title, text)
-                onOpenProject(id)
+                try {
+                    onOpenProject(container.projects.importText(title, text))
+                } catch (e: de.tontaube.core.DocumentException) {
+                    snackbar.showSnackbar(e.message ?: "Import fehlgeschlagen")
+                }
             }
         }
     }

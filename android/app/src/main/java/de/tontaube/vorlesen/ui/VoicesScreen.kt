@@ -150,6 +150,7 @@ fun VoicesScreen(snackbar: SnackbarHostState) {
                         scope.launch {
                             container.voices.delete(v)
                             container.projects.resetVoice(VoiceRef.custom(v.id))
+                            container.engine.state.value.projectId?.let { container.engine.onSettingsChanged(it) }
                             snackbar.showSnackbar("Stimme „${v.name}“ gelöscht. Projekte damit nutzen wieder die Standardstimme.")
                         }
                     },

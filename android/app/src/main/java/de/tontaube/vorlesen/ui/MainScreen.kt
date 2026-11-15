@@ -131,8 +131,12 @@ fun MainScreen(events: StateFlow<AppEvent?>, onEventHandled: () -> Unit) {
             is AppEvent.Connect -> connectLink = e.link
             is AppEvent.Import -> importUri(e.uri, e.mime)
             is AppEvent.ImportText -> {
-                val id = container.projects.importText(e.title, e.text)
-                nav.navigate("project/$id")
+                try {
+                    val id = container.projects.importText(e.title, e.text)
+                    nav.navigate("project/$id")
+                } catch (ex: DocumentException) {
+                    snackbar.showSnackbar(ex.message ?: "Import fehlgeschlagen")
+                }
             }
         }
         onEventHandled()
