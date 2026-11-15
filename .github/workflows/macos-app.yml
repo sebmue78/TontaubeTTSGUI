@@ -1,0 +1,63 @@
+name: macOS-App bauen
+
+on:
+  push:
+    branches: [main, macos-app]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14  # Apple Silicon (arm64)
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Tests (Client gegen Mock-Server)
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -r requirements-dev.txt
+          .venv/bin/python -m pytest -q
+
+      - name: App und DMG bauen
+        run: ./macos/build_app.sh --dmg
+
+      - name: Rauchtest – App starten, Oberfläche muss antworten
+        run: |
+          APP="dist/Tontaube TTS.app/Contents/MacOS/TontaubeTTS"
+          # launcher.sh schreibt sein Log nach ~/Library/Application Support/TontaubeTTS/logs
+          "$APP" &
+          for i in $(seq 1 120); do
+            if curl -sf -o /dev/null http://127.0.0.1:7860/; then echo "Oberfläche läuft nach ${i}s"; break; fi
+            sleep 2
+          done
+          curl -sf -o /dev/null http://127.0.0.1:7860/ || { cat "$HOME/Library/Application Support/TontaubeTTS/logs/app.log"; exit 1; }
+          sleep 20
+          echo "--- Launcher-Protokoll ---"
+          cat "$HOME/Library/Application Support/TontaubeTTS/logs/launcher.log" 2>/dev/null | tail -20 || true
+          pkill -f "tontaube_gui --managed" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tontaube-TTS-dmg
+          path: dist/Tontaube-TTS.dmg
+
+      - name: Als Release "macos-latest" veröffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=macos-latest
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" dist/Tontaube-TTS.dmg \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Tontaube TTS für macOS (Apple Silicon) – aktueller Stand" \
+            --notes "Automatisch gebaut aus ${GITHUB_REF_NAME} (${GITHUB_SHA::7}). DMG öffnen, App in den Programme-Ordner ziehen, beim ersten Öffnen Rechtsklick → Öffnen."
