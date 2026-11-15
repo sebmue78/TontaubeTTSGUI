@@ -33,11 +33,23 @@ Die App richtet beim ersten Start alles selbst ein:
 1. Oberfläche installieren (ca. 1–2 Minuten)
 2. Tontaube-Server v1.1.0 herunterladen und für Apple Silicon anpassen
 3. Python-Umgebung mit PyTorch einrichten (einige Minuten)
-4. Modelle herunterladen (ca. 8 GB, nur beim ersten Start)
+4. Modelle herunterladen (ca. 8,6 GB, nur beim ersten Start)
 
 Den Fortschritt zeigt die Oberfläche oben an. Ab dem zweiten Start ist sie nach kurzer Zeit bereit.
 
-### App bauen und installieren
+### Installation (fertiges DMG)
+
+1. Neueste Version laden: [Releases → macos-latest](https://github.com/sebmue78/TontaubeTTSGUI/releases/tag/macos-latest) → `Tontaube-TTS.dmg`
+   (wird bei jedem Push automatisch auf einem Apple-Silicon-Runner gebaut und getestet).
+2. DMG öffnen und **Tontaube TTS** in den Ordner **Programme** ziehen.
+3. Beim ersten Öffnen: Rechtsklick → **Öffnen** (die App ist nicht notarisiert).
+
+Gemessen auf einem MacBook Pro M5 Pro (64 GB): erster Start ca. 10 Minuten (vor allem Downloads),
+danach ca. 20 Sekunden bis „Bereit“. Die Erzeugung läuft auf der CPU mit etwa 1,4-facher
+Echtzeit (4 Sekunden Audio brauchen gut 5 Sekunden) und belegt rund 13 GB Arbeitsspeicher.
+Empfohlen sind daher mindestens 24 GB RAM.
+
+### App selbst bauen
 
 ```bash
 brew install uv            # einmalig
@@ -146,27 +158,15 @@ python -m tontaube_gui             # Terminal 2
 
 Tests: `python -m pytest`
 
-## Annahmen und offene Punkte
+## Stand der API-Annahmen
 
-Die Modellkarte und das Server-README beschreiben die API nicht vollständig. Wo etwas fehlte,
-habe ich Folgendes angenommen. Die genaue API zeigt der laufende Server unter
-`http://127.0.0.1:8080/docs`.
+Alle API-Details wurden am 15.11.2026 gegen einen echten Tontaube-Server v1.1.0 auf Apple Silicon
+geprüft (Sprachen `german`, `english`, …; `/controls` mit `bins`; SSE-Stream mit
+`{"audio_b64", "done"}`; Stimmen als `voice_path` wie `samples/Juri.mp3`). Die vollständige
+API zeigt der laufende Server unter `/docs`.
 
-* **Sprach-Strings:** belegt ist nur `"english"`. Für die anderen Sprachen wird dasselbe Muster
-  verwendet (`german`, `spanish`, `french`, `italian`, `dutch`, `portuguese`). Das Feld erlaubt
-  auch eigene Werte, falls der Server andere erwartet.
-* **Stimmenliste:** Der Server liefert 39 Stimmen mit, dokumentiert aber keinen Endpunkt, der sie
-  auflistet. Die GUI probiert `/voices`; antwortet der Server nicht, kann der Pfad (z. B.
-  `samples/Marcus.mp3`) frei eingetragen werden.
-* **`/controls`-Format:** nicht dokumentiert. Die GUI versteht mehrere gängige Formen und fällt
-  sonst auf die Werte aus der Modellkarte zurück.
-* **SSE-Format von `/stream`:** nicht dokumentiert. Die GUI erwartet Base64-Audio in `data:`-Zeilen
-  (als JSON mit `audio_b64`/`audio`/`chunk` oder als roher Base64-Text).
-* **Fortsetzen** funktioniert nur, wenn `/predict` `codebook_tokens` zurückgibt. Sonst zeigt die
-  GUI einen Hinweis.
-* **Nicht umgesetzt:** der WebSocket-Stream `/ws/stream` (Opus; Frame-Format nicht dokumentiert,
-  der SSE-Stream deckt Live-Wiedergabe ab) sowie `voice_tokens` (vorberechnete Stimmen-Tokens).
-  Beides lässt sich über *Erweitert → Zusätzliche Felder* trotzdem an den Server schicken.
+Nicht umgesetzt: der WebSocket-Stream `/ws/stream` (Opus) und `voice_tokens`. Beides lässt sich
+über *Erweitert → Zusätzliche Felder* trotzdem an den Server schicken.
 
 ## Lizenz
 
