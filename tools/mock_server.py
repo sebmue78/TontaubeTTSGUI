@@ -24,13 +24,15 @@ SR = 24000
 API_KEY = os.environ.get("TTS_API_KEY")
 app = FastAPI(title="Tontaube Mock")
 
-CONTROLS = {
-    "rate": {"min": 0, "max": 4, "description": "speaking rate"},
-    "pause": {"min": 0, "max": 4},
-    "pitch_range": {"min": 0, "max": 5},
-    "pitch_level": {"min": 0, "max": 4},
-    "legato": {"min": 0, "max": 2},
-}
+CONTROLS = {"controls": [
+    {"name": "rate", "bins": 5, "description": "speaking rate", "low": "much slower", "high": "much faster"},
+    {"name": "pause", "bins": 5, "description": "pauses", "low": "fewer shorter pauses", "high": "more longer pauses"},
+    {"name": "pitch_range", "bins": 6, "description": "intonation", "low": "flat monotone", "high": "very expressive"},
+    {"name": "pitch_level", "bins": 5, "description": "voice pitch", "low": "low deep voice", "high": "high voice"},
+    {"name": "legato", "bins": 3, "description": "crisp articulation", "low": "crisp staccato",
+     "high": "normal articulation", "default": 2},
+]}
+BINS = {c["name"]: c["bins"] for c in CONTROLS["controls"]}
 
 
 def _auth(key: str | None) -> None:
@@ -85,13 +87,12 @@ def predict(body: dict, x_api_key: str | None = Header(None)):
     if fmt != "wav":
         raise HTTPException(422, "mock supports only wav")
     for name, value in (body.get("controls") or {}).items():
-        spec = CONTROLS.get(name)
-        if spec is None or not spec["min"] <= value <= spec["max"]:
+        if name not in BINS or not 0 <= value < BINS[name]:
             raise HTTPException(422, f"invalid control {name}={value}")
     pcm = _pcm(text, body.get("controls") or {})
     return {
         "audio_b64": base64.b64encode(_wav(pcm)).decode(),
-        "format": "wav",
+        "mime_type": "audio/wav",
         "sample_rate": SR,
         "codebook_tokens": [[1, 2, 3]] * 4,
         "echo": {k: v for k, v in body.items() if k not in ("voice_audio_b64", "prefix_tokens")},
@@ -107,19 +108,20 @@ def stream(body: dict, x_api_key: str | None = Header(None)):
     text = _text(body)
     pcm = _pcm(text, body.get("controls") or {})
     enc = lameenc.Encoder()
-    enc.set_bit_rate(int(body.get("bitrate") or 64))
+    enc.set_bit_rate(int(str(body.get("bitrate") or "64k").rstrip("k")))
     enc.set_in_sample_rate(SR)
     enc.set_channels(1)
     enc.set_quality(5)
 
     def gen():
         step = SR * 2 // 2  # 0,5 s
-        for i in range(0, len(pcm), step):
-            data = enc.encode(pcm[i : i + step])
+        for n, i in enumerate(range(0, len(pcm), step)):
+            data = bytes(enc.encode(pcm[i : i + step]))
             if data:
-                yield f"event: audio\ndata: {json.dumps({'audio_b64': base64.b64encode(bytes(data)).decode()})}\n\n"
-        yield f"data: {json.dumps({'audio_b64': base64.b64encode(bytes(enc.flush())).decode()})}\n\n"
-        yield "event: done\ndata: {}\n\n"
+                yield f"data: {json.dumps({'index': n, 'audio_b64': base64.b64encode(data).decode(), 'done': False})}\n\n"
+        tail = base64.b64encode(bytes(enc.flush())).decode()
+        yield f"data: {json.dumps({'index': -1, 'audio_b64': tail, 'done': False})}\n\n"
+        yield f"data: {json.dumps({'done': True})}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

@@ -23,6 +23,7 @@ from .client import (
     DEFAULT_CONTROLS,
     DEFAULT_SERVER_URL,
     DEFAULT_VOICE,
+    STREAM_BITRATES,
     LANGUAGES,
     OUTPUT_FORMATS,
     STYLE_TAGS,
@@ -32,14 +33,24 @@ from .client import (
     TontaubeError,
     build_payload,
     concat_wav,
+    load_voice_catalog,
     wav_duration,
 )
 
 MAX_CONTROL_SLOTS = 8
+N_FORM = 22  # Anzahl der Formularfelder vor den Regler-Slots (siehe build_ui: form)
+VOICES = load_voice_catalog()
+
+
+def voice_choices(language_label: str | None = None) -> list[tuple[str, str]]:
+    """Stimmen als (Anzeige, voice_path); passende Sprache zuerst."""
+    lang = LANGUAGES.get(language_label or "", language_label or "")
+    ordered = sorted(VOICES, key=lambda v: (v.language != lang, v.language, v.name))
+    return [(v.label, v.path) for v in ordered] or [(DEFAULT_VOICE, DEFAULT_VOICE)]
 OUTPUT_DIR = Path(os.environ.get("TONTAUBE_OUTPUT_DIR", "outputs")).resolve()
 
 VOICE_DEFAULT = "Standardstimme (Marcus)"
-VOICE_BUNDLED = "Stimme vom Server (voice_path)"
+VOICE_BUNDLED = "Mitgelieferte Stimme"
 VOICE_CLONE = "Eigene Stimme klonen (Referenzaudio)"
 
 TRIM_DEFAULT = "Server-Standard (~250 ms)"
@@ -145,20 +156,13 @@ def check_server(url: str, api_key: str, timeout: float):
     voices = client.voices()
     if voices:
         lines.append(f"Stimmen vom Server: {len(voices)}")
+        voice_update = gr.update(choices=voices, value=voices[0])
     else:
-        lines.append(
-            "Keine Stimmenliste vom Server erhalten. Pfade unter `VOICE_PATH` (z. B. "
-            f"`{DEFAULT_VOICE}`) lassen sich trotzdem eintragen."
-        )
+        lines.append(f"{len(VOICES)} mitgelieferte Stimmen verfügbar.")
+        voice_update = gr.skip()
     if client.openapi():
         lines.append(f"API-Doku: {client.base_url}/docs")
-    voice_choices = sorted(set(voices + [DEFAULT_VOICE]))
-    return (
-        "\n\n".join(lines),
-        specs,
-        gr.update(choices=voice_choices, value=voice_choices[0] if DEFAULT_VOICE not in voice_choices else DEFAULT_VOICE),
-        *_control_slot_updates(specs),
-    )
+    return ("\n\n".join(lines), specs, voice_update, *_control_slot_updates(specs))
 
 
 def _collect(
@@ -179,6 +183,11 @@ def _collect(
     verbalize: bool,
     segment_controls_raw: str,
     extra_raw: str,
+    seed: str,
+    top_p: str,
+    top_k: str,
+    frequency_penalty: str,
+    acoustic_temperature: str,
     specs: list[ControlSpec],
     slot_values: list[Any],
     *,
@@ -204,6 +213,7 @@ def _collect(
         voice_audio = Path(voice_audio_path).read_bytes()
     elif voice_mode == VOICE_BUNDLED:
         vpath = (voice_path or "").strip() or None
+        vpath = next((v.path for v in VOICES if vpath in (v.label, v.name)), vpath)
 
     trim: Any = "default"
     if trim_mode == TRIM_OFF:
@@ -231,12 +241,29 @@ def _collect(
         prompt_max_tokens=int(prompt_max_tokens) if prompt_max_tokens else None,
         use_system_tag=None if system_tag else False,
         trim_silence_padding_ms=trim,
-        mossformer2_postprocess=None if mossformer else False,
+        mossformer2_postprocess=bool(mossformer),
         use_verbalization=True if verbalize else None,
         prefix_text=(prefix or {}).get("text"),
         prefix_tokens=(prefix or {}).get("tokens"),
+        sampling={
+            "seed": _opt_num(seed, int, "Seed"),
+            "top_p": _opt_num(top_p, float, "top_p"),
+            "top_k": _opt_num(top_k, int, "top_k"),
+            "frequency_penalty": _opt_num(frequency_penalty, float, "frequency_penalty"),
+            "acoustic_temperature": _opt_num(acoustic_temperature, float, "Akustik-Temperatur"),
+        },
         extra=extra,
     )
+
+
+def _opt_num(raw: Any, cast, what: str):
+    text = str(raw if raw is not None else "").strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        return cast(float(text)) if cast is int else cast(text)
+    except ValueError as exc:
+        raise TontaubeError(f"{what}: '{raw}' ist keine Zahl.") from exc
 
 
 def _history_rows(history: list[dict[str, Any]]) -> list[list[Any]]:
@@ -254,7 +281,7 @@ def synthesize(url, api_key, timeout, specs, history, last, *args, continue_mode
                     "Der Server hat bei der letzten Anfrage keine Tokens zurückgegeben."
                 )
             prefix = {"text": last["text"], "tokens": last["tokens"]}
-        payload = _collect(*args[:17], specs, list(args[17:]), prefix=prefix)
+        payload = _collect(*args[:N_FORM], specs, list(args[N_FORM:]), prefix=prefix)
         client = _client(url, api_key, timeout)
         started = dt.datetime.now()
         result = client.predict(payload)
@@ -320,16 +347,16 @@ def synthesize_continue(*args):
 def stream_speech(url, api_key, timeout, specs, history, bitrate, priority, max_new_tokens, initial_seconds, *args):
     text = args[0]
     try:
-        payload = _collect(*args[:17], specs, list(args[17:]))
+        payload = _collect(*args[:N_FORM], specs, list(args[N_FORM:]))
     except TontaubeError as exc:
         raise gr.Error(str(exc)) from exc
     payload["format"] = "mp3"
     for key in ("trim_silence_padding_ms", "mossformer2_postprocess", "prefix_text", "prefix_tokens"):
         payload.pop(key, None)  # gelten laut Server-README nicht für Streaming
-    if bitrate:
-        payload["bitrate"] = int(bitrate)
-    if priority:
-        payload["priority"] = int(priority)
+    if bitrate in STREAM_BITRATES:
+        payload["bitrate"] = bitrate
+    if priority in ("low", "high"):
+        payload["priority"] = priority
     if max_new_tokens:
         payload["max_new_tokens"] = int(max_new_tokens)
     if initial_seconds:
@@ -490,9 +517,9 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                             [VOICE_DEFAULT, VOICE_BUNDLED, VOICE_CLONE], value=VOICE_DEFAULT, show_label=False
                         )
                         voice_path = gr.Dropdown(
-                            [DEFAULT_VOICE],
-                            value=DEFAULT_VOICE,
-                            label="Stimme (Pfad unter VOICE_PATH)",
+                            voice_choices("Deutsch"),
+                            value=voice_choices("Deutsch")[0][1],
+                            label="Stimme (passende Sprache zuerst)",
                             allow_custom_value=True,
                             visible=False,
                         )
@@ -550,7 +577,8 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                                 trim_ms = gr.Number(250, label="Rest-Stille (ms)", minimum=0, precision=0)
                             with gr.Row():
                                 mossformer = gr.Checkbox(
-                                    True, label="MossFormer2-Nachbearbeitung (48 kHz, Pausen kürzen)"
+                                    False,
+                                    label="MossFormer2-Nachbearbeitung (48 kHz, Pausen kürzen; auf dem Mac langsam)",
                                 )
                                 verbalize = gr.Checkbox(
                                     False,
@@ -560,6 +588,13 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                             segment_controls = gr.Code(
                                 "", language="json", label="Segment-Regler (JSON-Liste, optional)", lines=3
                             )
+                            gr.Markdown("**Sampling** (leer = Server-Standard)")
+                            with gr.Row():
+                                seed = gr.Textbox("", label="Seed (für reproduzierbare Ergebnisse)", placeholder="zufällig")
+                                top_p = gr.Textbox("", label="top_p (0–1)", placeholder="Standard")
+                                top_k = gr.Textbox("", label="top_k", placeholder="Standard")
+                                frequency_penalty = gr.Textbox("", label="frequency_penalty (−2–2)", placeholder="0.1")
+                                acoustic_temperature = gr.Textbox("", label="Akustik-Temperatur (0–2)", placeholder="Standard")
                             extra = gr.Code(
                                 "",
                                 language="json",
@@ -581,11 +616,13 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             with gr.Tab("Live-Streaming"):
                 gr.Markdown(
                     "Nutzt Text, Sprache, Stil, Stimme und Regler aus dem Tab **Sprechen** und streamt MP3 "
-                    "über `/stream`. Die Wiedergabe startet, sobald die ersten Daten ankommen."
+                    "über `/stream`. Die Wiedergabe startet, sobald die ersten Daten ankommen. Auf dem Mac rechnet "
+                    "das Modell etwas langsamer als Echtzeit, bei längeren Texten kann die Wiedergabe deshalb kurz "
+                    "stocken. Ein längerer erster Chunk hilft."
                 )
                 with gr.Row():
-                    bitrate = gr.Number(0, label="Bitrate kbit/s (0 = Standard)", minimum=0, precision=0)
-                    priority = gr.Number(0, label="Priorität (0 = Standard)", precision=0)
+                    bitrate = gr.Dropdown(["Standard", *STREAM_BITRATES], value="Standard", label="Bitrate")
+                    priority = gr.Dropdown(["Standard", "low", "high"], value="Standard", label="Priorität")
                     max_new_tokens = gr.Number(
                         0, label="max_new_tokens je Chunk (0 = Standard, 50–400)", minimum=0, maximum=400, precision=0
                     )
@@ -621,6 +658,7 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             )
 
         voice_mode.change(on_voice_mode, voice_mode, [voice_path, voice_audio, voice_hint])
+        language.change(lambda lang: gr.update(choices=voice_choices(lang)), language, voice_path)
 
         def on_voice_audio(path):
             if not path:
@@ -661,6 +699,11 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             verbalize,
             segment_controls,
             extra,
+            seed,
+            top_p,
+            top_k,
+            frequency_penalty,
+            acoustic_temperature,
             *slot_components,
         ]
         outputs = [

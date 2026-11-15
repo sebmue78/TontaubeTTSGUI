@@ -69,6 +69,24 @@ def test_parse_controls_shapes(payload):
     assert specs["rate"].label == "Tempo"
 
 
+def test_parse_controls_real_server_format():
+    payload = {"controls": [{"name": "rate", "bins": 5, "low": "much slower", "high": "much faster"},
+                            {"name": "legato", "bins": 3, "default": 2}, {"name": "breath", "bins": 4,
+                            "description": "breathing", "low": "none", "high": "audible"}]}
+    specs = {s.name: s for s in parse_controls(payload)}
+    assert specs["rate"].maximum == 4 and specs["legato"].default == 2
+    assert specs["breath"].maximum == 3 and "none" in specs["breath"].description
+
+
+def test_voice_catalog():
+    from tontaube_gui.client import load_voice_catalog
+
+    voices = load_voice_catalog()
+    assert len(voices) == 46
+    assert voices[0].language == "german" and voices[0].path.startswith("samples/")
+    assert any(v.name == "Marcus" for v in voices)
+
+
 def test_parse_voices():
     assert parse_voices(["a.mp3", {"path": "b.mp3"}, {"name": "c"}]) == ["a.mp3", "b.mp3", "c"]
     assert parse_voices({"voices": ["x"]}) == ["x"]
@@ -79,6 +97,9 @@ def test_sse_parser():
     lines = [": ping", "event: audio", f"data: {json.dumps({'audio_b64': a})}", "", f"data: {b}", "",
              "event: done", "data: {}", "", "data: ignored"]
     assert list(iter_sse_audio(iter(lines))) == [b"AAA", b"BBB"]
+    lines = [f'data: {json.dumps({"index": 0, "audio_b64": a, "done": False})}', "",
+             f'data: {json.dumps({"done": True})}', ""]
+    assert list(iter_sse_audio(iter(lines))) == [b"AAA"]
 
 
 def test_sse_error_event():
@@ -120,7 +141,9 @@ def test_client_against_mock(mock_url):
     assert ok
     assert {s.name for s in c.controls()} == {"rate", "pause", "pitch_range", "pitch_level", "legato"}
     assert c.voices() == []
-    r = c.predict(build_payload("Hallo Welt", language="german", controls={"rate": 1}, voice_audio=_wav(6)))
+    r = c.predict(build_payload("Hallo Welt", language="german", controls={"rate": 1}, voice_audio=_wav(6),
+                                sampling={"seed": 3, "top_p": None}))
+    assert r.raw["echo"]["seed"] == 3 and "top_p" not in r.raw["echo"]
     assert r.format == "wav" and wav_duration(r.audio) > 0.5
     assert r.raw["had_voice_audio"] is True
     assert r.codebook_tokens is not None

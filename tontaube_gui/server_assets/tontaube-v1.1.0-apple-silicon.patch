@@ -173,3 +173,18 @@ index ea858ee..a377638 100644
          self._encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_AUDIO)
          self._encoder.bitrate = bitrate
  
+diff --git a/app/vibevoice_utils.py b/app/vibevoice_utils.py
+index 5fcd4bc..92bf886 100644
+--- a/app/vibevoice_utils.py
++++ b/app/vibevoice_utils.py
+@@ -21,7 +21,9 @@ def load_vibevoice_tokenizer(model_path: str, device: str | None = None, cpu_qua
+     """
+     if device is None:
+         device = "cuda" if torch.cuda.is_available() else "cpu"
+-    if device == "cpu":
++    from app.native import available as _native_available
++
++    if device == "cpu" and _native_available():
+         try:
+             from app.codec.vibevoice_cpu import CpuVibeVoice
+ 

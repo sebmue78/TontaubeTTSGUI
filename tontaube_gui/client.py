@@ -45,6 +45,51 @@ STYLE_TAGS: dict[str, str] = {
 }
 
 OUTPUT_FORMATS = ["wav", "mp3", "opus"]
+STREAM_BITRATES = ["32k", "64k", "96k", "128k"]
+
+_LANG_CODES = {"en": "english", "de": "german", "es": "spanish", "fr": "french", "it": "italian",
+               "nl": "dutch", "pt": "portuguese"}
+_LANG_LABELS = {v: k for k, v in LANGUAGES.items()}
+_STYLE_LABELS = {v: k for k, v in STYLE_TAGS.items()}
+
+
+@dataclass
+class Voice:
+    path: str  # relativ zu VOICE_PATH, z. B. "samples/Juri.mp3"
+    name: str
+    language: str  # z. B. "german"
+    style: str = ""
+
+    @property
+    def label(self) -> str:
+        parts = [_LANG_LABELS.get(self.language, self.language)]
+        if self.style:
+            parts.append(_STYLE_LABELS.get(self.style, self.style))
+        return f"{self.name} ({', '.join(parts)})"
+
+
+def load_voice_catalog(manifest: str | Path | None = None) -> list[Voice]:
+    """Stimmen aus ``voices/manifest.json`` des Servers (Standard: mitgelieferte Kopie von v1.1.0)."""
+    from pathlib import Path as _P
+
+    path = _P(manifest) if manifest else _P(__file__).resolve().parent / "server_assets" / "voices.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    voices = []
+    for filename, meta in (data.get("voices") or {}).items():
+        meta = meta if isinstance(meta, dict) else {}
+        lang = str(meta.get("language", ""))
+        voices.append(
+            Voice(
+                f"samples/{filename}",
+                filename.rsplit(".", 1)[0],
+                _LANG_CODES.get(lang, lang),
+                str(meta.get("style", "")),
+            )
+        )
+    return sorted(voices, key=lambda v: (v.language != "german", v.language, v.name))
 
 
 @dataclass
@@ -105,7 +150,7 @@ def _first_int(d: dict[str, Any], *keys: str) -> int | None:
 def _control_from_dict(name: str, d: dict[str, Any]) -> ControlSpec | None:
     lo = _first_int(d, "min", "minimum", "min_step", "low")
     hi = _first_int(d, "max", "maximum", "max_step", "high")
-    steps = d.get("steps") or d.get("levels") or d.get("labels")
+    steps = d.get("bins") or d.get("steps") or d.get("levels") or d.get("labels")
     if hi is None and isinstance(steps, int):
         lo, hi = 0, steps - 1
     elif hi is None and isinstance(steps, list) and steps:
@@ -118,8 +163,10 @@ def _control_from_dict(name: str, d: dict[str, Any]) -> ControlSpec | None:
             return None
         lo, hi = known.minimum, known.maximum
     label, desc = _KNOWN_LABELS.get(name, ("", ""))
-    desc = desc or str(d.get("description") or "")
-    return ControlSpec(name, lo, hi, label, desc, _first_int(d, "default", "neutral"))
+    if not desc:
+        low, high = d.get("low"), d.get("high")
+        desc = f"{lo} = {low} … {hi} = {high}" if low and high else str(d.get("description") or "")
+    return ControlSpec(name, lo, hi, label or str(d.get("description") or ""), desc, _first_int(d, "default", "neutral"))
 
 
 def parse_controls(payload: Any) -> list[ControlSpec]:
@@ -211,6 +258,7 @@ def build_payload(
     use_verbalization: bool | None = None,
     prefix_text: str | None = None,
     prefix_tokens: Any = None,
+    sampling: dict[str, Any] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Erzeugt den JSON-Body für ``/predict`` bzw. ``/stream``.
@@ -249,6 +297,8 @@ def build_payload(
     elif voice_path:
         payload["voice_path"] = voice_path
 
+    if sampling:
+        payload.update({k: v for k, v in sampling.items() if v is not None})
     if extra:
         payload.update(extra)
     return payload
@@ -425,6 +475,8 @@ def iter_sse_audio(lines: Iterator[str]) -> Iterator[bytes]:
             msg = obj.get("error") if isinstance(obj, dict) else data
             raise TontaubeError(f"Streaming-Fehler: {msg}")
         if isinstance(obj, dict):
+            if obj.get("done") and not _extract_audio_field(obj):
+                return
             audio = _extract_audio_field(obj)
             if audio:
                 yield _decode_b64(audio)

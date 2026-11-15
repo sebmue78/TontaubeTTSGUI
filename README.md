@@ -23,6 +23,56 @@ Eine Weboberfläche (Gradio) für das Sprachsynthese-Modell
 | **Verlauf** | Alle Ergebnisse der Sitzung mit Download |
 | **Server** | Frei wählbare Server-URL, API-Key (`x-api-key`), Verbindungstest (`/readyz`), Anzeige der gesendeten Anfrage, freie Zusatzfelder als JSON |
 
+## All-in-one-App für macOS (Apple Silicon)
+
+> **Experimentell.** Der offizielle Tontaube-Server unterstützt macOS nicht. Diese App bringt
+> einen kleinen Patch mit, der den Server auf Apple Silicon lauffähig macht (siehe unten).
+
+Die App richtet beim ersten Start alles selbst ein:
+
+1. Oberfläche installieren (ca. 1–2 Minuten)
+2. Tontaube-Server v1.1.0 herunterladen und für Apple Silicon anpassen
+3. Python-Umgebung mit PyTorch einrichten (einige Minuten)
+4. Modelle herunterladen (ca. 8 GB, nur beim ersten Start)
+
+Den Fortschritt zeigt die Oberfläche oben an. Ab dem zweiten Start ist sie nach kurzer Zeit bereit.
+
+### App bauen und installieren
+
+```bash
+brew install uv            # einmalig
+git clone -b macos-app https://github.com/sebmue78/TontaubeTTSGUI.git
+cd TontaubeTTSGUI
+./macos/build_app.sh --install      # baut "Tontaube TTS.app" und kopiert sie nach /Programme
+# oder: ./macos/build_app.sh --dmg  # erzeugt dist/Tontaube-TTS.dmg zum Weitergeben
+```
+
+Die App ist nicht von Apple notarisiert. Auf einem anderen Mac beim ersten Öffnen deshalb
+Rechtsklick → **Öffnen** wählen.
+
+### Wo liegt was?
+
+| Was | Ort |
+|---|---|
+| Erzeugte Audios | `~/Tontaube TTS/` |
+| Server, Python-Umgebungen, Protokolle | `~/Library/Application Support/TontaubeTTS/` |
+| Modelle | `~/.cache/huggingface/` und `~/.cache/tontaube/` |
+
+Beenden: in der Oberfläche unter **Eingebauter Server → Tontaube beenden**. Zum vollständigen
+Entfernen die App und die drei Ordner oben löschen.
+
+### Was der Mac-Patch ändert
+
+`tontaube_gui/server_assets/tontaube-v1.1.0-apple-silicon.patch`:
+
+* Die x86-AVX2-Kernel des CPU-Backends werden auf anderen CPUs übersprungen; stattdessen rechnen
+  die Modelle mit normalen PyTorch-Operationen (int4-Gewichte werden beim Laden entpackt).
+  `LITE_CPU_DTYPE` wählt `bfloat16` (Standard, halber Speicher) oder `float32`.
+* vLLM wird nicht installiert (gibt es für macOS nicht; das „lite“-Backend braucht es nicht).
+* libopus ist optional (nur für den WebSocket-Opus-Stream nötig).
+
+ffmpeg und opus werden bei Bedarf über Homebrew installiert.
+
 ## Wie es aufgebaut ist
 
 TontaubeV1.1 ist kein normales `transformers`-Modell. Laut Modellkarte läuft es nur über den
@@ -77,6 +127,7 @@ Optionen:
 python -m tontaube_gui --server-url http://gpu-rechner:8080 --api-key GEHEIM --port 7860
 python -m tontaube_gui --host 0.0.0.0     # im LAN erreichbar
 python -m tontaube_gui --share            # öffentlicher Gradio-Link
+python -m tontaube_gui --managed          # All-in-one: Server selbst einrichten und starten
 ```
 
 Auch per Umgebungsvariable: `TONTAUBE_URL`, `TONTAUBE_API_KEY`, `GUI_HOST`, `GUI_PORT`,
