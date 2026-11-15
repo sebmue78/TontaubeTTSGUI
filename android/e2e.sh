@@ -7,5 +7,9 @@ adb shell am instrument -w -e class de.tontaube.vorlesen.EndToEndTest \
   de.tontaube.vorlesen.debug.test/androidx.test.runner.AndroidJUnitRunner | tee instrument.txt
 mkdir -p e2e-screens
 adb pull /sdcard/Android/data/de.tontaube.vorlesen.debug/files/screens/. e2e-screens/ || true
-adb logcat -d -t 400 > e2e-logcat.txt || true
+adb logcat -d > e2e-logcat.txt || true
+echo "--- logcat (Auszug) ---"
+grep -E "E2E|ExoPlayer|AudioTrack|MediaCodec|tontaube|AndroidRuntime|PlaybackException|Exception" e2e-logcat.txt | grep -v glBind | tail -80
+echo "--- Mock-Server ---"
+tail -30 ../mock.log 2>/dev/null || true
 grep -q "^OK (" instrument.txt

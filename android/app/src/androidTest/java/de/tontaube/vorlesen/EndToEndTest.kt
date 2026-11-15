@@ -69,9 +69,13 @@ class EndToEndTest {
         screenshot("02-projekt")
 
         compose.onAllNodes(hasContentDescription("Vorlesen")).onFirst().performClick()
-        compose.waitUntil(60_000) { c.engine.state.value.isPlaying }
-        screenshot("03-wiedergabe")
-        assertTrue("Fehler: ${c.engine.state.value.error}", c.engine.state.value.error == null)
+        try {
+            compose.waitUntil(60_000) { c.engine.state.value.let { it.isPlaying || it.error != null } }
+        } finally {
+            screenshot("03-wiedergabe")
+            android.util.Log.i("E2E", "Zustand: ${c.engine.state.value} playbackState=${compose.runOnUiThread { c.engine.player.playbackState }}")
+        }
+        assertTrue("Fehler: ${c.engine.state.value}", c.engine.state.value.isPlaying && c.engine.state.value.error == null)
 
         // Erster Abschnitt muss vollständig im Zwischenspeicher landen
         compose.waitUntil(60_000) {
