@@ -32,6 +32,8 @@ from pathlib import Path
 
 import requests
 
+from .network import NetworkSettings, lan_addresses
+
 SERVER_VERSION = "v1.1.0"
 SERVER_TARBALL = f"https://codeload.github.com/craitech/tontaube/tar.gz/refs/tags/{SERVER_VERSION}"
 ASSETS = Path(__file__).resolve().parent / "server_assets"
@@ -60,16 +62,16 @@ def default_device() -> str:
     return "cpu"
 
 
-def _free_port(preferred: int) -> int:
+def _free_port(preferred: int, host: str = "127.0.0.1") -> int:
     for port in [preferred, *range(preferred + 1, preferred + 50)]:
         with socket.socket() as s:
             try:
-                s.bind(("127.0.0.1", port))
+                s.bind((host, port))
                 return port
             except OSError:
                 continue
     with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
+        s.bind((host, 0))
         return s.getsockname()[1]
 
 
@@ -136,6 +138,8 @@ class ServerManager:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self.network = NetworkSettings.load(self.home / "network.json")
+        self._lan_active = False  # Stand des laufenden Servers (nicht der gespeicherten Einstellung)
         self._hf_cache = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
         self._cache_baseline = 0
         atexit.register(self.stop)
@@ -195,11 +199,43 @@ class ServerManager:
         if s.detail:
             lines.append(s.detail)
         if s.url and s.phase == "ready":
+            lan = " · 📶 im Netzwerk freigegeben" if self._lan_active else ""
             lines.append(
                 f"Server: `{s.url}` · Rechenwerk: {self.DEVICE_LABELS.get(self.device, self.device)} · "
-                f"Genauigkeit: `{self.dtype}`"
+                f"Genauigkeit: `{self.dtype}`{lan}"
             )
         return "\n\n".join(lines)
+
+    # -- Netzwerk-Freigabe ----------------------------------------------
+    @property
+    def lan_active(self) -> bool:
+        """Läuft der Server gerade im LAN-Modus (an alle Schnittstellen gebunden, mit API-Key)?"""
+        return self._lan_active
+
+    @property
+    def client_key(self) -> str:
+        """API-Key, den Clients (auch die eigene Oberfläche) gerade mitschicken müssen."""
+        return self.network.api_key if self._lan_active else ""
+
+    @property
+    def port(self) -> int | None:
+        try:
+            return int(self.state.url.rsplit(":", 1)[1]) if self.state.url else None
+        except (IndexError, ValueError):
+            return None
+
+    def lan_urls(self) -> list[str]:
+        port = self.port or self.network.port
+        return [f"http://{addr}:{port}" for addr in lan_addresses()]
+
+    def set_network(self, enabled: bool, regenerate_key: bool = False) -> bool:
+        """Speichert die Freigabe. Gibt True zurück, wenn der Server dafür neu starten muss."""
+        changed = self.network.enabled != enabled or (regenerate_key and enabled)
+        self.network.enabled = enabled
+        if regenerate_key or not self.network.api_key:
+            self.network.regenerate_key()
+        self.network.save()
+        return changed or (enabled != self._lan_active)
 
     @property
     def url(self) -> str:
@@ -358,7 +394,7 @@ class ServerManager:
         if proc.wait() != 0 and not self._stop.is_set():
             raise RuntimeError(f"Befehl fehlgeschlagen ({proc.returncode}): {' '.join(cmd[:4])} …")
 
-    def _server_env(self, tools_path: list[str], port: int) -> dict[str, str]:
+    def _server_env(self, tools_path: list[str], port: int, lan: bool = False) -> dict[str, str]:
         env = dict(os.environ)
         env.update(
             {
@@ -366,7 +402,7 @@ class ServerManager:
                 "LITE_DEVICE": self.device,
                 "PYTORCH_ENABLE_MPS_FALLBACK": "1",
                 "LITE_CPU_DTYPE": self.dtype,
-                "TTS_HOST": "127.0.0.1",
+                "TTS_HOST": "0.0.0.0" if lan else "127.0.0.1",
                 "TTS_PORT": str(port),
                 "ENABLE_STREAMING": "1",
                 "PATH": os.pathsep.join([str(self.venv / "bin"), *tools_path, env.get("PATH", "")]),
@@ -377,10 +413,18 @@ class ServerManager:
                 "TOKENIZERS_PARALLELISM": "false",
             }
         )
+        if lan:
+            # Im LAN gilt immer API-Key-Pflicht (Header x-api-key). /readyz und /healthz bleiben offen.
+            env.update({"REQUIRE_API_KEY": "1", "TTS_API_KEY": self.network.api_key})
+        else:
+            env.pop("REQUIRE_API_KEY", None)
+            env.pop("TTS_API_KEY", None)
         return env
 
     def _start_server(self, tools_path: list[str]) -> None:
-        port = _free_port(self.preferred_port)
+        lan = self.network.enabled and bool(self.network.api_key)
+        port = _free_port(self.network.port if lan else self.preferred_port, "0.0.0.0" if lan else "127.0.0.1")
+        self._lan_active = lan
         self.state.url = f"http://127.0.0.1:{port}"
         self._cache_baseline = _dir_size(self._hf_cache)
         self.logs.mkdir(parents=True, exist_ok=True)
@@ -392,7 +436,7 @@ class ServerManager:
         self.proc = subprocess.Popen(
             [str(exe), "serve"],
             cwd=self.src,
-            env=self._server_env(tools_path, port),
+            env=self._server_env(tools_path, port, lan),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,

@@ -410,6 +410,47 @@ def clear_history():
     return [], None, [], []
 
 
+def _lan_info_html(manager, pending: bool = False) -> str:
+    """Adresse, API-Key und QR-Code für die Android-App."""
+    from html import escape
+
+    from .network import connect_link, device_name, qr_svg_data_uri
+
+    net = manager.network
+    if not net.enabled:
+        return "<p style='opacity:.75'>Nicht freigegeben. Der Server ist nur auf diesem Mac erreichbar.</p>"
+    urls = manager.lan_urls()
+    if pending or not manager.lan_active or manager.state.phase != "ready":
+        note = "⏳ Der Server startet gerade im Netzwerk-Modus neu. Das dauert etwa 20 Sekunden."
+    else:
+        note = "🟢 Freigegeben. In der Android-App <b>Server hinzufügen → QR-Code scannen</b> wählen."
+    if not urls:
+        return f"<p>{note}</p><p>⚠️ Keine Netzwerkadresse gefunden. Ist der Mac mit dem WLAN verbunden?</p>"
+    link = connect_link(urls[0], net.api_key, device_name())
+    qr = qr_svg_data_uri(link)
+    qr_html = (
+        f"<img src='{qr}' alt='QR-Code für die Android-App' style='width:200px;height:200px;"
+        f"background:#fff;border-radius:12px;padding:4px'/>"
+        if qr
+        else "<p>(QR-Code nicht verfügbar: Paket <code>segno</code> fehlt.)</p>"
+    )
+    from .network import bonjour_name
+
+    alt = bonjour_name()
+    rows = "".join(f"<li><code>{escape(u)}</code></li>" for u in urls)
+    if alt:
+        rows += f"<li><code>http://{escape(alt)}:{manager.port or net.port}</code> (Bonjour-Name)</li>"
+    return f"""
+<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start">
+  <div>{qr_html}</div>
+  <div style="min-width:260px">
+    <p>{note}</p>
+    <p><b>Server-Adresse</b></p><ul>{rows}</ul>
+    <p><b>API-Key</b><br><code style="user-select:all;font-size:1.05em">{escape(net.api_key)}</code></p>
+  </div>
+</div>"""
+
+
 # ---------------------------------------------------------------------------
 # Oberfläche
 # ---------------------------------------------------------------------------
@@ -490,8 +531,22 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                     folder_btn = gr.Button("Ausgabeordner öffnen", scale=1)
                     quit_btn = gr.Button("Tontaube beenden", variant="stop", scale=1)
                 managed_log = gr.Code(manager.log_tail(), label="Protokoll", lines=14, interactive=False)
+            with gr.Accordion("📱 Im Netzwerk freigeben (Android-App)", open=manager.network.enabled):
+                gr.Markdown(
+                    "Macht den eingebauten Server im lokalen Netz erreichbar, z. B. für die "
+                    "**Tontaube-Android-App**. Zugriff nur mit API-Key. Die Verbindung ist nicht "
+                    "verschlüsselt, deshalb nur im eigenen WLAN nutzen. Beim ersten Mal fragt macOS, ob "
+                    "eingehende Verbindungen erlaubt werden sollen: bitte **Erlauben** wählen."
+                )
+                with gr.Row():
+                    lan_enabled = gr.Checkbox(
+                        manager.network.enabled, label="Im Netzwerk freigeben (Server startet dafür neu)", scale=3
+                    )
+                    lan_newkey_btn = gr.Button("Neuen API-Key erzeugen", scale=1)
+                lan_info = gr.HTML(_lan_info_html(manager))
             connected_state = gr.State(False)
             timer = gr.Timer(2.0)
+            lan_timer = gr.Timer(10.0)
 
         with gr.Accordion("Server-Verbindung", open=manager is None, visible=True):
             with gr.Row():
@@ -748,17 +803,41 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                 ready = manager.state.phase == "ready"
                 base = [manager.status_markdown(), manager.log_tail()]
                 if ready and not connected:
-                    return [*base, gr.update(value=manager.url), True, *check_server(manager.url, key, tmo)]
+                    key = manager.client_key
+                    return [
+                        *base, gr.update(value=manager.url), gr.update(value=key), True,
+                        *check_server(manager.url, key, tmo),
+                    ]
                 if not ready and connected:
-                    return [*base, gr.update(), False, *[gr.skip()] * len(check_outputs)]
-                return [*base, gr.update(), connected, *[gr.skip()] * len(check_outputs)]
+                    return [*base, gr.update(), gr.update(), False, *[gr.skip()] * len(check_outputs)]
+                return [*base, gr.update(), gr.update(), connected, *[gr.skip()] * len(check_outputs)]
 
             timer.tick(
                 tick,
                 [connected_state, api_key, timeout],
-                [managed_status, managed_log, url, connected_state, *check_outputs],
+                [managed_status, managed_log, url, api_key, connected_state, *check_outputs],
                 show_progress="hidden",
             )
+
+            def _restart_for_network():
+                threading.Thread(target=manager.restart, daemon=True).start()
+
+            def on_lan_toggle(enabled):
+                if manager.set_network(bool(enabled)):
+                    _restart_for_network()
+                    return _lan_info_html(manager, pending=True), False
+                return _lan_info_html(manager), gr.skip()
+
+            def on_new_key():
+                manager.set_network(manager.network.enabled, regenerate_key=True)
+                if manager.network.enabled:
+                    _restart_for_network()
+                    return _lan_info_html(manager, pending=True), False
+                return _lan_info_html(manager), gr.skip()
+
+            lan_enabled.input(on_lan_toggle, lan_enabled, [lan_info, connected_state])
+            lan_newkey_btn.click(on_new_key, None, [lan_info, connected_state])
+            lan_timer.tick(lambda: _lan_info_html(manager), None, lan_info, show_progress="hidden")
 
             def do_restart(device, dtype):
                 threading.Thread(target=manager.restart, kwargs={"dtype": dtype, "device": device}, daemon=True).start()
