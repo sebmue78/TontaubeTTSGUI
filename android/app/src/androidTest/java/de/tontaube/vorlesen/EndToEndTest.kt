@@ -4,6 +4,9 @@ import android.Manifest
 import android.graphics.Bitmap
 import android.os.Build
 import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.printToString
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -97,20 +100,29 @@ class EndToEndTest {
         screenshot("05-einstellungen")
     }
 
+    /** Wartet auf [cond]; bei Zeitüberschreitung schlägt der Test mit [what] und dem aktuellen Semantikbaum fehl. */
+    private fun waitFor(what: String, timeoutMs: Long = 5_000, cond: () -> Boolean) {
+        try {
+            compose.waitUntil(timeoutMs) { cond() }
+        } catch (e: ComposeTimeoutException) {
+            val tree = runCatching { compose.onRoot().printToString(maxDepth = Int.MAX_VALUE) }.getOrDefault("?")
+            throw AssertionError("Zeitüberschreitung: $what\n$tree", e)
+        }
+    }
+
+    private fun count(text: String) = compose.onAllNodes(hasText(text)).fetchSemanticsNodes().size
+
     /** Tabwechsel: Einstellungen → Bibliothek → Stimmen → Bibliothek muss jeweils den richtigen Bildschirm zeigen. */
     @Test
     fun bottomNavigationSwitchesTabs() {
         fun tab(label: String) = compose.onAllNodes(hasText(label) and hasClickAction()).onFirst().performClick()
-        fun shows(title: String) = compose.waitUntil(5_000) { compose.onAllNodes(hasText(title)).fetchSemanticsNodes().size >= 2 }
 
-        compose.waitUntil(10_000) { compose.onAllNodes(hasText("Bibliothek")).fetchSemanticsNodes().isNotEmpty() }
-        repeat(2) {
-            tab("Einstellungen"); shows("Einstellungen")
-            tab("Bibliothek"); compose.waitUntil(5_000) { compose.onAllNodes(hasText("Importieren")).fetchSemanticsNodes().isNotEmpty() }
-            // Nur noch die Beschriftung in der Leiste – der Einstellungen-Bildschirm muss weg sein
-            compose.waitUntil(5_000) { compose.onAllNodes(hasText("Einstellungen")).fetchSemanticsNodes().size == 1 }
-            tab("Stimmen"); shows("Stimmen")
-            tab("Bibliothek"); compose.waitUntil(5_000) { compose.onAllNodes(hasText("Importieren")).fetchSemanticsNodes().isNotEmpty() }
+        waitFor("Start", 10_000) { count("Importieren") > 0 }
+        repeat(2) { round ->
+            tab("Einstellungen"); waitFor("Einstellungen offen ($round)") { count("Einstellungen") >= 2 && count("Importieren") == 0 }
+            tab("Bibliothek"); waitFor("zurück in der Bibliothek ($round)") { count("Importieren") > 0 && count("Einstellungen") == 1 }
+            tab("Stimmen"); waitFor("Stimmen offen ($round)") { count("Stimmen") >= 2 && count("Importieren") == 0 }
+            tab("Bibliothek"); waitFor("wieder in der Bibliothek ($round)") { count("Importieren") > 0 && count("Stimmen") == 1 }
         }
         screenshot("06-tabs")
     }
