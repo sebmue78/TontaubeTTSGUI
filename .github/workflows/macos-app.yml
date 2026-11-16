@@ -3,7 +3,9 @@ name: macOS-App bauen
 on:
   push:
     branches: [main, macos-app]
-    paths-ignore: ["**.md", "docs/**"]
+    paths-ignore: ["**.md", "docs/**", "android/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "android/**"]
   workflow_dispatch:
 
 permissions:
@@ -51,13 +53,19 @@ jobs:
           name: Tontaube-TTS-dmg
           path: dist/Tontaube-TTS.dmg
 
-      - name: Als Release "macos-latest" veröffentlichen
+      - name: Als Release veröffentlichen (main/macos-app → "macos-latest", sonst "macos-vorschau")
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG=macos-latest
+          TITLE="Tontaube TTS für macOS (Apple Silicon) – aktueller Stand"
+          case "$GITHUB_REF_NAME" in
+            main|macos-app) ;;
+            *) TAG=macos-vorschau; TITLE="Tontaube TTS für macOS (Apple Silicon) – Vorschau aus $GITHUB_REF_NAME" ;;
+          esac
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" dist/Tontaube-TTS.dmg \
             --target "$GITHUB_SHA" --prerelease \
-            --title "Tontaube TTS für macOS (Apple Silicon) – aktueller Stand" \
+            --title "$TITLE" \
             --notes "Automatisch gebaut aus ${GITHUB_REF_NAME} (${GITHUB_SHA::7}). DMG öffnen, App in den Programme-Ordner ziehen, beim ersten Öffnen Rechtsklick → Öffnen."
