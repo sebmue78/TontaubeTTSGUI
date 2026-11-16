@@ -14,6 +14,7 @@ import de.tontaube.core.TtsSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -47,10 +48,31 @@ class ProjectRepository(
     fun segmentFile(project: ProjectEntity, index: Int) = File(audioDir(project), "$index.mp3")
 
     fun text(id: Long): SegmentedText {
-        textCache.get(id)?.let { return it }
-        val st = TontaubeJson.decodeFromString(SegmentedText.serializer(), textFile(id).readText())
-        textCache.put(id, st)
-        return st
+        synchronized(textCache) {
+            textCache.get(id)?.let { return it }
+            var st = TontaubeJson.decodeFromString(SegmentedText.serializer(), textFile(id).readText())
+            if (st.version < Segmenter.VERSION) st = migrate(id, st)
+            textCache.put(id, st)
+            return st
+        }
+    }
+
+    /**
+     * Projekt mit älterer Aufteilung neu aufteilen (Abschnitte enden jetzt an Satzenden). Die Leseposition wird
+     * auf den Abschnitt umgerechnet, der die alte Stelle enthält; erzeugtes Audio passt nicht mehr und wird gelöscht.
+     */
+    private fun migrate(id: Long, old: SegmentedText): SegmentedText {
+        val (fresh, map) = segmenter.resegment(old)
+        if (fresh.segments.isEmpty()) return old
+        textFile(id).writeText(TontaubeJson.encodeToString(SegmentedText.serializer(), fresh))
+        audioRoot(id).deleteRecursively()
+        runBlocking {
+            dao.get(id)?.let { p ->
+                val index = map.getOrElse(p.segmentIndex) { 0 }.coerceIn(0, fresh.segments.size - 1)
+                dao.update(p.copy(segmentIndex = index, positionMs = 0, segmentCount = fresh.segments.size, charCount = fresh.totalChars))
+            }
+        }
+        return fresh
     }
 
     suspend fun textAsync(id: Long): SegmentedText = withContext(Dispatchers.IO) { text(id) }

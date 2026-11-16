@@ -107,7 +107,12 @@ data class Segment(val chapter: Int, val text: String)
 data class ChapterInfo(val title: String, val firstSegment: Int)
 
 @Serializable
-data class SegmentedText(val segments: List<Segment>, val chapters: List<ChapterInfo>) {
+data class SegmentedText(
+    val segments: List<Segment>,
+    val chapters: List<ChapterInfo>,
+    /** Version der Aufteilung ([Segmenter.VERSION]); ältere Projekte werden beim Laden neu aufgeteilt. */
+    val version: Int = 1,
+) {
     val totalChars: Int get() = segments.sumOf { it.text.length }
 
     /** Anteil des Textes vor Abschnitt [index] (für die Fortschrittsanzeige). */

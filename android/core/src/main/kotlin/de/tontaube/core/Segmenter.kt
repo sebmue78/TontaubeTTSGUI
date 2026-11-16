@@ -2,8 +2,8 @@ package de.tontaube.core
 
 /**
  * Teilt ein Dokument in Vorlese-Abschnitte. Ein Abschnitt ist die Einheit für Streaming, Zwischenspeicher
- * und Fortsetzen. Kurze Absätze (Überschriften, Dialogzeilen) werden mit dem folgenden zusammengelegt,
- * lange an Satzgrenzen geteilt.
+ * und Fortsetzen. Abschnitte enden an Satzenden (bevorzugt am Absatzende); kurze Absätze (Überschriften,
+ * Dialogzeilen) werden mit dem folgenden zusammengelegt, lange Absätze an Satzgrenzen geteilt.
  */
 class Segmenter(
     private val targetChars: Int = 450,
@@ -26,33 +26,119 @@ class Segmenter(
             chapters += ChapterInfo(chapter.title ?: if (doc.chapters.size > 1) "Teil ${chapters.size + 1}" else doc.title, segments.size)
             pieces.forEach { segments += Segment(ci, it) }
         }
-        return SegmentedText(segments, chapters)
+        return SegmentedText(segments, chapters, VERSION)
     }
 
-    private fun chapterPieces(paragraphs: List<String>): List<String> {
-        val out = mutableListOf<String>()
-        val pending = StringBuilder()
-        fun flushPending() {
-            if (pending.isNotEmpty()) { out += pending.toString(); pending.clear() }
+    /**
+     * Text eines Projekts mit älterer Aufteilung neu aufteilen. Liefert den neuen Text und zu jedem alten
+     * Abschnitt den Index des neuen Abschnitts, der dessen Anfang enthält (zum Umrechnen der Leseposition).
+     */
+    fun resegment(old: SegmentedText): Pair<SegmentedText, IntArray> {
+        // Alte Abschnitte kapitelweise (in Reihenfolge) gruppieren
+        val groups = mutableListOf<MutableList<Int>>()
+        old.segments.forEachIndexed { i, seg ->
+            if (i == 0 || old.segments[i - 1].chapter != seg.chapter) groups += mutableListOf<Int>()
+            groups.last() += i
         }
+        val doc = ParsedDocument(
+            title = old.chapters.firstOrNull()?.title ?: "",
+            author = null,
+            chapters = groups.mapIndexed { g, idx ->
+                val title = old.chapters.getOrNull(g)?.title?.takeIf { old.chapters.size == groups.size }
+                Chapter(title, idx.flatMap { old.segments[it].text.split('\n') }.map { it.trim() }.filter { it.isNotEmpty() })
+            },
+            format = DocumentFormat.TXT,
+        )
+        val fresh = segment(doc)
+        val mapping = IntArray(old.segments.size)
+        var newBase = 0
+        groups.forEachIndexed { g, idx ->
+            val newIdx = fresh.segments.indices.filter { fresh.segments[it].chapter == g }
+            val newStarts = newIdx.runningFold(0) { acc, i -> acc + fresh.segments[i].text.length + 1 }
+            var oldStart = 0
+            for (i in idx) {
+                val k = newStarts.indexOfLast { it <= oldStart }.coerceIn(0, (newIdx.size - 1).coerceAtLeast(0))
+                mapping[i] = newIdx.getOrElse(k) { newBase }
+                oldStart += old.segments[i].text.length + 1
+            }
+            if (newIdx.isNotEmpty()) newBase = newIdx.last() + 1
+        }
+        return fresh to mapping
+    }
+
+    companion object {
+        /** 2: Abschnitte enden an Satzenden, auch über Absatzgrenzen hinweg. */
+        const val VERSION = 2
+    }
+
+    /** Wie gut sich die Stelle nach einem Textstück als Abschnittsende eignet. */
+    private enum class Boundary { NONE, SOFT, SENTENCE }
+
+    /** Ein Satz (oder Satzteil) mit der Information, ob danach ein Absatz endet. */
+    private class Unit(val text: String, val paragraphEnd: Boolean, val boundary: Boundary)
+
+    private val sentenceTerminal = Regex("[.!?…][\"»«“”'’)\\]]*$")
+
+    private fun endsSentence(t: String) = sentenceTerminal.containsMatchIn(t.trimEnd())
+
+    /**
+     * Abschnitte enden immer an einem Satzende – auch über Absatzgrenzen hinweg. Ein Absatzende mitten im Satz
+     * (z. B. Seiten- oder Spaltenumbruch im PDF, Überschrift) beendet keinen Abschnitt. Nur ein einzelner Satz,
+     * der länger als [maxChars] ist, wird an Satzzeichen (Semikolon, Doppelpunkt, Komma, Gedankenstrich) geteilt.
+     */
+    private fun chapterPieces(paragraphs: List<String>): List<String> {
+        val units = mutableListOf<Unit>()
         for (p in paragraphs) {
-            val parts = if (p.length > maxChars) splitLong(p) else listOf(p)
-            for (part in parts) {
-                when {
-                    pending.isEmpty() -> pending.append(part)
-                    pending.length < minChars && pending.length + part.length + 1 <= maxChars -> pending.append('\n').append(part)
-                    part.length < minChars && pending.length + part.length + 1 <= targetChars -> pending.append('\n').append(part)
-                    else -> { flushPending(); pending.append(part) }
-                }
+            val pieces = sentences(p).flatMap { sentence ->
+                if (sentence.length <= maxChars) listOf(sentence to Boundary.SENTENCE)
+                else splitSentence(sentence).let { parts -> parts.mapIndexed { i, part -> part to if (i == parts.lastIndex) Boundary.SENTENCE else Boundary.SOFT } }
+            }
+            pieces.forEachIndexed { i, (text, b) ->
+                val boundary = if (b == Boundary.SENTENCE && !endsSentence(text)) Boundary.NONE else b
+                units += Unit(text, i == pieces.lastIndex, boundary)
             }
         }
-        flushPending()
+
+        val hardMax = maxChars * 2
+        val out = mutableListOf<String>()
+        val current = StringBuilder()
+        var last: Unit? = null
+        fun flush() {
+            if (current.isNotEmpty()) out += current.toString()
+            current.clear(); last = null
+        }
+        for (u in units) {
+            val prev = last
+            if (prev != null) {
+                val wouldBe = current.length + 1 + u.text.length
+                val overflow = wouldBe > maxChars && prev.boundary != Boundary.NONE
+                if (overflow || wouldBe > hardMax) flush()
+            }
+            val before = last
+            if (before != null) current.append(joiner(before, u))
+            current.append(u.text)
+            last = u
+            val len = current.length
+            when {
+                u.boundary == Boundary.SENTENCE && u.paragraphEnd && len >= minChars -> flush()
+                u.boundary == Boundary.SENTENCE && len >= targetChars -> flush()
+            }
+        }
+        flush()
         // Sehr kurzes Kapitelende an den vorigen Abschnitt hängen
         if (out.size >= 2 && out.last().length < minChars / 2 && out[out.size - 2].length + out.last().length < maxChars) {
-            val last = out.removeAt(out.lastIndex)
-            out[out.lastIndex] = out.last() + "\n" + last
+            val tail = out.removeAt(out.lastIndex)
+            out[out.lastIndex] = out.last() + "\n" + tail
         }
         return out
+    }
+
+    /** Trenner zwischen zwei Stücken: Leerzeichen im Satz, Zeilenumbruch zwischen echten Absätzen. */
+    private fun joiner(prev: Unit, next: Unit): String {
+        if (!prev.paragraphEnd) return " "
+        // Absatzende mitten im Satz (umbrochener Satz): kleingeschriebene Fortsetzung → als Fließtext verbinden
+        val continues = prev.boundary == Boundary.NONE && next.text.firstOrNull()?.isLowerCase() == true
+        return if (continues) " " else "\n"
     }
 
     fun sentences(text: String): List<String> {
