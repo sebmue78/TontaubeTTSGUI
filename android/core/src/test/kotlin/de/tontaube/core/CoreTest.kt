@@ -206,3 +206,47 @@ class ConnectLinkTest {
         assertNull(ConnectLink.parse("hallo welt"))
     }
 }
+
+class BufferPolicyTest {
+    @Test
+    fun manualModeIsFixed() {
+        assertEquals(120, BufferPolicy.targetSeconds(120, 0.5, start = true))
+        assertEquals(120, BufferPolicy.targetSeconds(120, null, start = false))
+    }
+
+    @Test
+    fun autoScalesWithServerSpeed() {
+        // Unbekannt: schnell starten, nach Stocken etwas mehr puffern
+        assertEquals(5, BufferPolicy.targetSeconds(BufferPolicy.AUTO, null, start = true))
+        assertEquals(30, BufferPolicy.targetSeconds(BufferPolicy.AUTO, null, start = false))
+        // Deutlich schneller als Echtzeit: kaum Puffer nötig
+        assertEquals(3, BufferPolicy.targetSeconds(BufferPolicy.AUTO, 2.0, start = true))
+        // 0,8× Echtzeit: 300 s × 0,2 = 60 s
+        assertEquals(60, BufferPolicy.targetSeconds(BufferPolicy.AUTO, 0.8, start = true))
+        // Knapp um Echtzeit: Mindestpuffer
+        assertEquals(BufferPolicy.MIN_AUTO_S, BufferPolicy.targetSeconds(BufferPolicy.AUTO, 1.05, start = false))
+        // Sehr langsam: gedeckelt
+        assertEquals(BufferPolicy.MAX_S, BufferPolicy.targetSeconds(BufferPolicy.AUTO, 0.1, start = true).coerceAtLeast(BufferPolicy.MAX_S))
+    }
+
+    @Test
+    fun windowCoversTarget() {
+        // 450 Zeichen ≈ 32 s Audio; 120 s Puffer + Reserve brauchen 7 Abschnitte
+        assertEquals(7, BufferPolicy.windowSegments(120, 450))
+        assertEquals(3, BufferPolicy.windowSegments(3, 450))
+        assertTrue(BufferPolicy.windowSegments(600, 450) in 20..30)
+    }
+
+    @Test
+    fun rateEstimatorAverages() {
+        val r = RateEstimator(minObservedSeconds = 10.0)
+        r.add(8.0, 5.0)
+        assertNull(r.rate)
+        r.add(8.0, 10.0)
+        val v = r.rate!!
+        assertTrue("$v", v in 1.0..1.2)
+        val s = RateEstimator()
+        s.seed(0.8)
+        assertEquals(0.8, s.rate!!, 0.001)
+    }
+}

@@ -47,6 +47,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.ListItem
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
@@ -364,11 +365,22 @@ private fun PlayerPanel(
             if (isCurrent && s.isBuffering) {
                 var waited by remember { mutableStateOf(0) }
                 LaunchedEffect(Unit) { while (true) { delay(1000); waited++ } }
+                val target = s.bufferTargetMs
                 Text(
-                    if (waited < 4) "Abschnitt wird erzeugt …" else "Abschnitt wird erzeugt … ($waited s)",
+                    when {
+                        target >= 10_000 -> "Puffert für flüssiges Vorlesen … ${s.bufferedMs / 1000} von ${target / 1000} s"
+                        waited < 4 -> "Abschnitt wird erzeugt …"
+                        else -> "Abschnitt wird erzeugt … ($waited s)"
+                    },
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.align(Alignment.CenterHorizontally),
                 )
+                if (target >= 10_000) {
+                    LinearProgressIndicator(
+                        progress = { (s.bufferedMs.toFloat() / target).coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp, vertical = 4.dp),
+                    )
+                }
             }
         }
     }

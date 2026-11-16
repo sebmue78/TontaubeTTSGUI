@@ -2,9 +2,12 @@ package de.tontaube.vorlesen.data
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import de.tontaube.core.BufferPolicy
 import de.tontaube.core.ControlSpec
 import de.tontaube.core.TontaubeJson
 import de.tontaube.core.TtsSettings
@@ -21,6 +24,8 @@ class Preferences(private val context: Context) {
     private val defaultsKey = stringPreferencesKey("default_settings")
     private val controlsKey = stringPreferencesKey("controls")
     private val themeKey = stringPreferencesKey("theme")
+    private val bufferModeKey = intPreferencesKey("buffer_mode")
+    private fun generationRateKey(serverId: Long) = floatPreferencesKey("generation_rate_$serverId")
 
     val activeServerId: Flow<Long?> = context.dataStore.data.map { it[activeServerKey] }
     val defaults: Flow<TtsSettings> = context.dataStore.data.map { TtsSettings.decode(it[defaultsKey]) }
@@ -33,6 +38,20 @@ class Preferences(private val context: Context) {
     val theme: Flow<String> = context.dataStore.data.map { it[themeKey] ?: "system" }
 
     suspend fun activeServerIdNow(): Long? = activeServerId.first()
+
+    /** Vorpuffer: [BufferPolicy.AUTO] oder feste Sekunden. */
+    val bufferMode: Flow<Int> = context.dataStore.data.map { it[bufferModeKey] ?: BufferPolicy.AUTO }
+
+    suspend fun setBufferMode(mode: Int) {
+        context.dataStore.edit { it[bufferModeKey] = mode }
+    }
+
+    /** Zuletzt gemessene Erzeugungsgeschwindigkeit eines Servers (Audiosekunden je Sekunde). */
+    suspend fun generationRate(serverId: Long): Float? = context.dataStore.data.first()[generationRateKey(serverId)]
+
+    suspend fun setGenerationRate(serverId: Long, rate: Float) {
+        context.dataStore.edit { it[generationRateKey(serverId)] = rate }
+    }
 
     suspend fun setActiveServer(id: Long?) {
         context.dataStore.edit { if (id == null) it.remove(activeServerKey) else it[activeServerKey] = id }

@@ -23,7 +23,7 @@ class AppContainer(app: Application) {
     val voices = VoiceRepository(app, db)
     val projects = ProjectRepository(app, db, prefs, voices)
     val servers = ServerRepository(db, prefs, api, scope)
-    val engine by lazy { PlaybackEngine(app, projects, voices, servers, api, scope) }
+    val engine by lazy { PlaybackEngine(app, projects, voices, servers, prefs, api, scope) }
 }
 
 @UnstableApi

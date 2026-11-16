@@ -10,7 +10,6 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
@@ -18,9 +17,12 @@ import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.extractor.Extractor
 import androidx.media3.extractor.ExtractorsFactory
 import androidx.media3.extractor.mp3.Mp3Extractor
+import de.tontaube.core.BufferPolicy
+import de.tontaube.core.RateEstimator
 import de.tontaube.core.SegmentedText
 import de.tontaube.core.TtsRequest
 import de.tontaube.core.TtsSettings
+import de.tontaube.vorlesen.data.Preferences
 import de.tontaube.vorlesen.data.ProjectEntity
 import de.tontaube.vorlesen.data.ProjectRepository
 import de.tontaube.vorlesen.data.ServerRepository
@@ -57,6 +59,12 @@ data class PlaybackState(
     val speed: Float = 1f,
     val error: String? = null,
     val finished: Boolean = false,
+    /** Bereits erzeugtes Audio vor der Abspielposition. */
+    val bufferedMs: Long = 0,
+    /** So viel Audio wird abgewartet, bevor es (weiter) losgeht. */
+    val bufferTargetMs: Long = 0,
+    /** Gemessene Servergeschwindigkeit bezogen auf das Tempo (1,0 = Echtzeit), null = noch unbekannt. */
+    val realtimeFactor: Double? = null,
 ) {
     val hasProject: Boolean get() = projectId != null
 }
@@ -64,9 +72,10 @@ data class PlaybackState(
 data class SampleState(val loading: Boolean = false, val playing: Boolean = false, val error: String? = null)
 
 /**
- * Spielt Vorlese-Projekte abschnittsweise ab. Im Player liegt immer nur ein kleines Fenster an Abschnitten
- * (aktueller + die nächsten [AHEAD]); beim Weiterschalten wird es nachgefüllt. Der Player lädt dabei bis zu
- * zwei Minuten im Voraus, sodass der Server die nächsten Abschnitte schon erzeugt, während der aktuelle läuft.
+ * Spielt Vorlese-Projekte abschnittsweise ab. Im Player liegt ein Fenster an Abschnitten (aktueller + die
+ * nächsten [ahead]); beim Weiterschalten wird es nachgefüllt. Der Player lädt ohne Pause voraus, sodass der
+ * Server immer die nächsten Abschnitte erzeugt. Wie viel Audio vor dem Start bzw. nach einem Stocken
+ * abgewartet wird, richtet sich nach der Vorpuffer-Einstellung und der gemessenen Servergeschwindigkeit.
  */
 @UnstableApi
 class PlaybackEngine(
@@ -74,6 +83,7 @@ class PlaybackEngine(
     private val projects: ProjectRepository,
     private val voices: VoiceRepository,
     private val servers: ServerRepository,
+    private val prefs: Preferences,
     api: TontaubeApi,
     private val scope: CoroutineScope,
 ) {
@@ -81,7 +91,9 @@ class PlaybackEngine(
     private val sampleIds = AtomicLong()
 
     private val resolver = SegmentResolver { uri -> resolve(uri) }
-    private val dataSourceFactory = SegmentDataSource.Factory(api, resolver)
+    private val loadStats = SegmentDataSource.LoadStats()
+    private val dataSourceFactory = SegmentDataSource.Factory(api, resolver, loadStats)
+    private val loadControl = AdaptiveLoadControl()
 
     private val extractors = ExtractorsFactory {
         arrayOf<Extractor>(Mp3Extractor(Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING))
@@ -102,12 +114,7 @@ class PlaybackEngine(
 
     val player: ExoPlayer = ExoPlayer.Builder(context)
         .setMediaSourceFactory(mediaSourceFactory)
-        .setLoadControl(
-            DefaultLoadControl.Builder()
-                .setBufferDurationsMs(30_000, 120_000, 1_000, 2_000)
-                .setPrioritizeTimeOverSizeThresholds(true)
-                .build(),
-        )
+        .setLoadControl(loadControl)
         .setAudioAttributes(
             AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_SPEECH).build(),
             /* handleAudioFocus = */ true,
@@ -119,7 +126,9 @@ class PlaybackEngine(
         .build()
 
     val samplePlayer: ExoPlayer = ExoPlayer.Builder(context)
-        .setMediaSourceFactory(ProgressiveMediaSource.Factory(dataSourceFactory, extractors).setLoadErrorHandlingPolicy(errorPolicy))
+        .setMediaSourceFactory(
+            ProgressiveMediaSource.Factory(SegmentDataSource.Factory(api, resolver), extractors).setLoadErrorHandlingPolicy(errorPolicy),
+        )
         .setAudioAttributes(
             AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_SPEECH).build(),
             true,
@@ -137,6 +146,20 @@ class PlaybackEngine(
     private var ticker: Job? = null
     private var lastSaved = 0L
 
+    // -- Vorpuffer ------------------------------------------------------------------------------
+    /** Vorpuffer-Einstellung ([BufferPolicy.AUTO] oder Sekunden). */
+    private var bufferMode = BufferPolicy.AUTO
+    /** Erzeugungsgeschwindigkeit des aktiven Servers (Audiosekunden je Sekunde, unabhängig vom Tempo). */
+    private var rate = RateEstimator()
+    private var serverId: Long? = null
+    private var lastPersistedRate = 0L
+    /** Anzahl Abschnitte, die nach dem aktuellen im Player liegen. */
+    private var ahead = 3
+    /** Wurde im aktuellen Fenster schon gespielt? Dann gilt beim nächsten Warten die Schwelle „nach Stocken“. */
+    private var playedInWindow = false
+    /** Wird bei jedem Fensterwechsel erhöht; Messungen über einen Wechsel hinweg werden verworfen. */
+    private var windowGeneration = 0
+
     init {
         player.addListener(object : Player.Listener {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -145,6 +168,7 @@ class PlaybackEngine(
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (isPlaying) playedInWindow = true
                 publish()
                 if (isPlaying) startTicker() else savePosition()
             }
@@ -174,6 +198,25 @@ class PlaybackEngine(
                 _sample.value = SampleState(error = describe(error))
             }
         })
+    }
+
+    init {
+        scope.launch {
+            prefs.bufferMode.collect { mode ->
+                bufferMode = mode
+                applyBufferTargets()
+            }
+        }
+        scope.launch {
+            servers.active.collect { s ->
+                if (s?.id == serverId) return@collect
+                serverId = s?.id
+                rate = RateEstimator()
+                s?.let { srv -> prefs.generationRate(srv.id)?.let { rate.seed(it.toDouble()) } }
+                applyBufferTargets()
+            }
+        }
+        startMonitor()
     }
 
     // -- Steuerung ------------------------------------------------------------------------------
@@ -279,7 +322,10 @@ class PlaybackEngine(
     /** Wiedergabe-Tempo eines Projekts ändern (gilt sofort, wenn es gerade geöffnet ist). */
     fun setSpeed(projectId: Long, speed: Float) {
         val isCurrent = project?.id == projectId
-        if (isCurrent) player.setPlaybackSpeed(speed)
+        if (isCurrent) {
+            player.setPlaybackSpeed(speed)
+            applyBufferTargets() // der Echtzeitfaktor hängt vom Tempo ab
+        }
         scope.launch {
             val s = TtsSettings.decode(projects.get(projectId)?.settingsJson).copy(playbackSpeed = speed)
             projects.updateSettings(projectId, s)
@@ -383,9 +429,12 @@ class PlaybackEngine(
 
     private fun applyWindow(p: ProjectEntity, t: SegmentedText, index: Int, positionMs: Long, play: Boolean) {
         val settings = TtsSettings.decode(p.settingsJson)
-        val items = (index..minOf(index + AHEAD, t.segments.size - 1)).map { mediaItem(p, t, it) }
+        val items = (index..minOf(index + ahead, t.segments.size - 1)).map { mediaItem(p, t, it) }
         // Laufende Erzeugungen des alten Fensters abbrechen, damit der Server frei wird
         dataSourceFactory.cancelAll()
+        playedInWindow = false
+        windowGeneration++
+        ahead = windowSize(t, settings.playbackSpeed)
         _state.update { it.copy(error = null, finished = false) }
         player.setPlaybackSpeed(settings.playbackSpeed)
         player.setMediaItems(items, 0, positionMs)
@@ -402,7 +451,7 @@ class PlaybackEngine(
         if (current > 0) player.removeMediaItems(0, current)
         val lastInWindow = (player.mediaItemCount - 1).takeIf { it >= 0 }?.let { player.getMediaItemAt(it).segmentIndex() } ?: index
         var next = (lastInWindow ?: index) + 1
-        while (next <= minOf(index + AHEAD, t.segments.size - 1)) {
+        while (next <= minOf(index + ahead, t.segments.size - 1)) {
             player.addMediaItem(mediaItem(p, t, next))
             next++
         }
@@ -455,7 +504,90 @@ class PlaybackEngine(
                 durationMs = player.duration,
                 seekable = player.isCurrentMediaItemSeekable,
                 speed = player.playbackParameters.speed,
+                bufferedMs = player.totalBufferedDuration.coerceAtLeast(0),
+                bufferTargetMs = (if (playedInWindow) loadControl.rebufferUs else loadControl.startBufferUs) / 1000,
+                realtimeFactor = realtimeFactor(),
             )
+        }
+    }
+
+    // -- Vorpuffer ------------------------------------------------------------------------------
+
+    /** Servergeschwindigkeit bezogen auf das eingestellte Tempo (1,0 = Echtzeit). */
+    private fun realtimeFactor(): Double? = rate.rate?.let { it / player.playbackParameters.speed.coerceAtLeast(0.25f) }
+
+    private fun windowSize(t: SegmentedText, speed: Float): Int {
+        val target = maxOf(
+            BufferPolicy.targetSeconds(bufferMode, realtimeFactor(), start = true),
+            BufferPolicy.targetSeconds(bufferMode, realtimeFactor(), start = false),
+        )
+        val avg = if (t.segments.isEmpty()) 450 else t.totalChars / t.segments.size
+        return BufferPolicy.windowSegments(target, avg, speed)
+    }
+
+    /** Schwellen und Fenstergröße an Einstellung und Messung anpassen. */
+    private fun applyBufferTargets() {
+        val r = realtimeFactor()
+        loadControl.startBufferUs = BufferPolicy.targetSeconds(bufferMode, r, start = true) * 1_000_000L
+        loadControl.rebufferUs = BufferPolicy.targetSeconds(bufferMode, r, start = false) * 1_000_000L
+        val t = text
+        if (t != null && project != null && player.mediaItemCount > 0) {
+            val wanted = windowSize(t, player.playbackParameters.speed)
+            if (wanted > ahead) {
+                ahead = wanted
+                currentIndex()?.let { onSegmentChanged(it) } // Fenster nachfüllen
+            } else {
+                ahead = wanted
+            }
+        }
+        publish()
+    }
+
+    /**
+     * Misst jede Sekunde, wie viel Audio der Server erzeugt hat: Zuwachs des Puffers plus abgespielte Zeit.
+     * Gezählt wird nur, solange tatsächlich vom Server gestreamt (nicht aus dem Speicher gelesen) wird.
+     */
+    private fun startMonitor() {
+        scope.launch {
+            var lastTime = 0L
+            var lastBuffered = 0L
+            var lastCacheOpens = -1L
+            var lastGeneration = -1
+            var lastPlaying = false
+            var lastFactor: Double? = null
+            while (isActive) {
+                delay(1000)
+                if (project == null) { lastCacheOpens = -1; continue }
+                val now = android.os.SystemClock.elapsedRealtime()
+                val buffered = player.totalBufferedDuration
+                val cacheOpens = loadStats.cacheOpens.get()
+                val playing = player.isPlaying
+                val streaming = loadStats.networkStreams.get() > 0 && player.isLoading
+                val valid = streaming && lastCacheOpens == cacheOpens && lastGeneration == windowGeneration &&
+                    lastPlaying == playing && buffered < AdaptiveLoadControl.MAX_BUFFER_MS - 5_000
+                if (valid) {
+                    val dtMs = now - lastTime
+                    val playedMs = if (playing) dtMs * player.playbackParameters.speed else 0f
+                    val producedMs = (buffered - lastBuffered) + playedMs
+                    if (producedMs >= 0) rate.add(producedMs / 1000.0, dtMs / 1000.0)
+                }
+                lastTime = now; lastBuffered = buffered; lastCacheOpens = cacheOpens
+                lastGeneration = windowGeneration; lastPlaying = playing
+
+                val factor = realtimeFactor()
+                if (factor != null && (lastFactor == null || kotlin.math.abs(factor - lastFactor) > 0.05)) {
+                    lastFactor = factor
+                    applyBufferTargets()
+                }
+                rate.rate?.let { g ->
+                    val id = serverId
+                    if (id != null && now - lastPersistedRate > 30_000) {
+                        lastPersistedRate = now
+                        launch { prefs.setGenerationRate(id, g.toFloat()) }
+                    }
+                }
+                if (player.playbackState == Player.STATE_BUFFERING) publish()
+            }
         }
     }
 
@@ -514,7 +646,6 @@ class PlaybackEngine(
     }
 
     companion object {
-        const val AHEAD = 3
         const val SKIP_MS = 15_000L
     }
 }
