@@ -85,6 +85,7 @@ class ServerRepository(
             if (result is ServerStatus.Ready) {
                 dao.touch(server.id, System.currentTimeMillis())
                 if (result.controls.isNotEmpty()) prefs.setControls(result.controls)
+                prefs.setModels(result.models)
             }
         }
     }

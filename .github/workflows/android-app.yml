@@ -3,9 +3,9 @@ name: Android-App bauen
 on:
   push:
     branches: [main, macos-app, "claude/**"]
-    paths: ["android/**", ".github/workflows/android-app.yml"]
+    paths: ["android/**", ".github/workflows/android-app.yml", "tontaube_gui/server_assets/model_gateway.py", "tools/mock_server.py"]
   pull_request:
-    paths: ["android/**", ".github/workflows/android-app.yml"]
+    paths: ["android/**", ".github/workflows/android-app.yml", "tontaube_gui/server_assets/model_gateway.py", "tools/mock_server.py"]
   workflow_dispatch:
 
 permissions:
@@ -87,11 +87,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Mock-Server starten
+      - name: Mock-Server und Modell-Gateway (Testmodus) starten
         run: |
           pip install -q -r requirements-dev.txt
-          TTS_API_KEY=testkey nohup python tools/mock_server.py > mock.log 2>&1 &
+          # Tontaube-Mock intern auf 8090, davor das Gateway mit API-Key auf 8080 (wie in der Desktop-App)
+          TTS_PORT=8090 nohup python tools/mock_server.py > mock.log 2>&1 &
+          GATEWAY_HOST=0.0.0.0 GATEWAY_PORT=8080 GATEWAY_UPSTREAM=http://127.0.0.1:8090 GATEWAY_FAKE_ENGINES=1 \
+            REQUIRE_API_KEY=1 TTS_API_KEY=testkey nohup python tontaube_gui/server_assets/model_gateway.py > gateway.log 2>&1 &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/readyz && break; sleep 1; done
+          curl -sf -H "x-api-key: testkey" http://127.0.0.1:8080/models
 
       - name: Emulator-Test
         uses: reactivecircus/android-emulator-runner@v2
@@ -112,4 +116,5 @@ jobs:
             android/instrument.txt
             android/e2e-logcat.txt
             mock.log
+            gateway.log
           if-no-files-found: ignore

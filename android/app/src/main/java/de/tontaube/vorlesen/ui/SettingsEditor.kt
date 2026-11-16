@@ -62,6 +62,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import de.tontaube.core.ControlSpec
 import de.tontaube.core.Languages
+import de.tontaube.core.ModelSpec
+import de.tontaube.core.Models
 import de.tontaube.core.Styles
 import de.tontaube.core.TtsSettings
 import de.tontaube.core.VoiceRef
@@ -98,6 +100,9 @@ fun SettingsSheet(
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var s by remember { mutableStateOf(initial) }
     val controls by container.prefs.controls.collectAsStateWithLifecycle(ControlSpec.defaults)
+    val models by container.prefs.models.collectAsStateWithLifecycle(listOf(ModelSpec.tontaube))
+    val spec = models.firstOrNull { it.id == s.modelId }
+        ?: if (s.isTontaube) ModelSpec.tontaube else ModelSpec(s.modelId, s.modelId)
     val customVoices by container.voices.custom.collectAsStateWithLifecycle(emptyList())
     val sample by container.engine.sample.collectAsStateWithLifecycle()
     val changesAudio = initial.copy(playbackSpeed = 1f) != s.copy(playbackSpeed = 1f)
@@ -110,11 +115,25 @@ fun SettingsSheet(
             Text(title, style = MaterialTheme.typography.titleLarge)
             note?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
 
+            if (models.size > 1 || !s.isTontaube) {
+                val options = (models.map { it.name to it.id } +
+                    listOfNotNull(("${s.modelId} (auf diesem Server nicht verfügbar)" to s.modelId).takeIf { models.none { m -> m.id == s.modelId } }))
+                Dropdown("Modell", options, s.modelId) { id -> s = withModel(s, models.firstOrNull { it.id == id }) }
+                spec.description.takeIf { it.isNotEmpty() }?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+
             VoicePicker(s.voice, s.language, customVoices) { s = s.copy(voice = it) }
 
-            Dropdown("Sprache", Languages.all, s.language) { s = s.copy(language = it) }
+            val langOptions = Languages.all.filter { spec.languages.isEmpty() || it.second in spec.languages }
+            if (s.modelId == Models.CHATTERBOX_TURBO) {
+                TagsInfo(spec.tags)
+            } else {
+                Dropdown("Sprache", langOptions.ifEmpty { Languages.all }, s.language) { s = s.copy(language = it) }
+            }
 
-            Column {
+            if (s.isTontaube) Column {
                 Text("Sprechstil", style = MaterialTheme.typography.labelLarge)
                 Spacer(Modifier.height(6.dp))
                 SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
@@ -128,24 +147,42 @@ fun SettingsSheet(
                 }
             }
 
+            val tempDefault = spec.params.firstOrNull { it.name == "temperature" }?.default ?: 0.7f
             OptionalSlider(
                 label = "Temperatur",
-                hint = "niedriger = textgetreuer, höher = lebendiger (Standard 0,7)",
-                value = s.temperature, default = 0.7f, range = 0.1f..1.5f, steps = 13,
+                hint = "niedriger = textgetreuer, höher = lebendiger (Standard ${String.format(Locale.GERMANY, "%.1f", tempDefault)})",
+                value = s.temperature, default = tempDefault, range = 0.1f..1.5f, steps = 13,
                 format = { String.format(Locale.GERMANY, "%.1f", it) },
             ) { s = s.copy(temperature = it) }
 
-            HorizontalDivider()
-            Text("Stil-Regler", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Nicht aktivierte Regler überlässt das Modell sich selbst.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            controls.forEach { spec ->
-                ControlRow(spec, s.controls[spec.name]) { v ->
-                    s = s.copy(controls = if (v == null) s.controls - spec.name else s.controls + (spec.name to v))
+            if (s.isTontaube) {
+                HorizontalDivider()
+                Text("Stil-Regler", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Nicht aktivierte Regler überlässt das Modell sich selbst.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                controls.forEach { c ->
+                    ControlRow(c, s.controls[c.name]) { v ->
+                        s = s.copy(controls = if (v == null) s.controls - c.name else s.controls + (c.name to v))
+                    }
                 }
             }
+            if (s.modelId == Models.CHATTERBOX) {
+                OptionalSlider(
+                    label = "Emotion",
+                    hint = "0,5 = neutral, höher = ausdrucksstärker und etwas schneller",
+                    value = s.exaggeration, default = 0.5f, range = 0.2f..2.0f, steps = 17,
+                    format = { String.format(Locale.GERMANY, "%.1f", it) },
+                ) { s = s.copy(exaggeration = it) }
+                OptionalSlider(
+                    label = "Führung (CFG)",
+                    hint = "niedriger = ruhiger und langsamer; bei hoher Emotion etwa 0,3",
+                    value = s.cfgWeight, default = 0.5f, range = 0f..1f, steps = 9,
+                    format = { String.format(Locale.GERMANY, "%.1f", it) },
+                ) { s = s.copy(cfgWeight = it) }
+            }
+            if (s.modelId == Models.QWEN3) QwenOptions(spec, s) { s = it }
 
             HorizontalDivider()
             Column {
@@ -161,6 +198,13 @@ fun SettingsSheet(
             }
 
             Advanced(s) { s = it }
+            if (!s.isTontaube) {
+                Text(
+                    "${spec.name}${spec.license.takeIf { it.isNotEmpty() }?.let { " · Lizenz $it" }.orEmpty()}. " +
+                        "Läuft auf dem Mac über das Modell-Gateway der Desktop-App. Das erste Vorlesen lädt das Modell und kann einige Minuten dauern.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
 
             if (changesAudio && note != null) {
                 Text(
@@ -372,7 +416,7 @@ private fun Advanced(s: TtsSettings, onChange: (TtsSettings) -> Unit) {
                     listOf("Server-Standard" to "", "32 kbit/s" to "32k", "64 kbit/s" to "64k", "96 kbit/s" to "96k", "128 kbit/s" to "128k"),
                     s.bitrate.orEmpty(),
                 ) { onChange(s.copy(bitrate = it.ifEmpty { null })) }
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                if (s.isTontaube) Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("System-Tag verwenden", style = MaterialTheme.typography.labelLarge)
                         Text("Sprache und Stil als Anweisung an das Modell (empfohlen).", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -382,4 +426,56 @@ private fun Advanced(s: TtsSettings, onChange: (TtsSettings) -> Unit) {
             }
         }
     }
+}
+
+/** Modell wechseln: Sprache an das Modell anpassen, modellfremde Einstellungen bleiben (werden nicht gesendet). */
+internal fun withModel(s: TtsSettings, model: ModelSpec?): TtsSettings {
+    val id = model?.id ?: Models.TONTAUBE
+    val langs = model?.languages.orEmpty()
+    val language = when {
+        id == Models.CHATTERBOX_TURBO -> "english"
+        langs.isNotEmpty() && s.language !in langs -> if ("german" in langs) "german" else langs.first()
+        else -> s.language
+    }
+    return s.copy(model = id.takeIf { it != Models.TONTAUBE }, language = language)
+}
+
+@Composable
+private fun TagsInfo(tags: List<String>) {
+    OutlinedCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Nur Englisch · Tags", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "Chatterbox Turbo liest englische Texte und versteht Tags direkt im Text, z. B. " +
+                    "„That was close [laugh] really close.“ Schreib die Tags in das Dokument, bevor du es importierst. " +
+                    "Bei anderen Modellen werden diese Tags automatisch weggelassen.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                tags.ifEmpty { de.tontaube.core.Tags.turbo }.joinToString("  "),
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+@Composable
+private fun QwenOptions(spec: ModelSpec, s: TtsSettings, onChange: (TtsSettings) -> Unit) {
+    val speakers = listOf("Automatisch" to "") + spec.speakers.map { it.label to it.id }
+    Dropdown("Sprecher", speakers, s.speaker.orEmpty()) { onChange(s.copy(speaker = it.ifEmpty { null })) }
+    Text(
+        "Mit eigener oder mitgelieferter Stimme wird diese geklont (der Sprecher gilt dann nicht). Ohne Stimme und " +
+            "ohne Sprecher entsteht die Stimme aus der Beschreibung unten. Keiner der fertigen Sprecher ist deutscher Muttersprachler.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    var text by remember { mutableStateOf(s.instruct.orEmpty()) }
+    OutlinedTextField(
+        text,
+        { t -> text = t.take(300); onChange(s.copy(instruct = text.ifBlank { null })) },
+        label = { Text(if (s.speaker != null) "Stil-Anweisung" else "Stil-Anweisung bzw. Stimmbeschreibung") },
+        placeholder = { Text("z. B. „Ruhig und warm, wie ein Hörbuchsprecher“") },
+        supportingText = { Text("Gilt für den ganzen Abschnitt, nicht für einzelne Stellen im Satz.") },
+        modifier = Modifier.fillMaxWidth(),
+        minLines = 2,
+    )
 }

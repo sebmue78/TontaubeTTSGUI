@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import de.tontaube.core.BufferPolicy
 import de.tontaube.core.ControlSpec
+import de.tontaube.core.ModelSpec
 import de.tontaube.core.TontaubeJson
 import de.tontaube.core.TtsSettings
 import kotlinx.coroutines.flow.Flow
@@ -23,6 +24,7 @@ class Preferences(private val context: Context) {
     private val activeServerKey = longPreferencesKey("active_server")
     private val defaultsKey = stringPreferencesKey("default_settings")
     private val controlsKey = stringPreferencesKey("controls")
+    private val modelsKey = stringPreferencesKey("models")
     private val themeKey = stringPreferencesKey("theme")
     private val bufferModeKey = intPreferencesKey("buffer_mode")
     private fun generationRateKey(serverId: Long) = floatPreferencesKey("generation_rate_$serverId")
@@ -32,6 +34,16 @@ class Preferences(private val context: Context) {
     val controls: Flow<List<ControlSpec>> = context.dataStore.data.map { prefs ->
         prefs[controlsKey]?.let { runCatching { TontaubeJson.decodeFromString(ListSerializer(ControlSpec.serializer()), it) }.getOrNull() }
             ?.takeIf { it.isNotEmpty() } ?: ControlSpec.defaults
+    }
+
+    /** Modelle des aktiven Servers (mindestens Tontaube). */
+    val models: Flow<List<ModelSpec>> = context.dataStore.data.map { prefs ->
+        prefs[modelsKey]?.let { runCatching { TontaubeJson.decodeFromString(ListSerializer(ModelSpec.serializer()), it) }.getOrNull() }
+            ?.takeIf { it.isNotEmpty() } ?: listOf(ModelSpec.tontaube)
+    }
+
+    suspend fun setModels(models: List<ModelSpec>) {
+        context.dataStore.edit { it[modelsKey] = TontaubeJson.encodeToString(ListSerializer(ModelSpec.serializer()), models) }
     }
 
     /** "system", "light" oder "dark". */

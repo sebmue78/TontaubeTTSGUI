@@ -1,6 +1,7 @@
 package de.tontaube.vorlesen.net
 
 import de.tontaube.core.ControlSpec
+import de.tontaube.core.ModelSpec
 import de.tontaube.core.ServerErrors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -24,7 +25,8 @@ data class ServerConfig(val url: String, val apiKey: String?)
 sealed interface ServerStatus {
     data object Unknown : ServerStatus
     data object Checking : ServerStatus
-    data class Ready(val controls: List<ControlSpec>) : ServerStatus
+    /** [models]: Modelle laut `GET /models` (leer = reiner Tontaube-Server ohne Modell-Gateway). */
+    data class Ready(val controls: List<ControlSpec>, val models: List<ModelSpec> = emptyList()) : ServerStatus
     data object Loading : ServerStatus
     data class Error(val message: String) : ServerStatus
 }
@@ -59,7 +61,7 @@ class TontaubeApi {
                 if (!r.isSuccessful) return@withContext ServerStatus.Error("Unerwartete Antwort (HTTP ${r.code}). Ist das ein Tontaube-Server?")
             }
             // /controls ist geschützt: prüft zugleich den API-Key
-            quick.newCall(request(server, "/controls").build()).execute().use { r ->
+            val status = quick.newCall(request(server, "/controls").build()).execute().use { r ->
                 when {
                     r.code == 401 || r.code == 403 -> ServerStatus.Error("API-Key fehlt oder ist falsch.")
                     r.code == 503 -> ServerStatus.Loading
@@ -67,10 +69,18 @@ class TontaubeApi {
                     else -> ServerStatus.Ready(runCatching { ControlSpec.parse(r.body!!.string()) }.getOrDefault(emptyList()))
                 }
             }
+            if (status is ServerStatus.Ready) status.copy(models = models(server)) else status
         } catch (e: IOException) {
             ServerStatus.Error(describe(e))
         }
     }
+
+    /** Modelle des Servers. Ohne Modell-Gateway (404) oder bei Fehlern: leere Liste. */
+    private fun models(server: ServerConfig): List<ModelSpec> = runCatching {
+        quick.newCall(request(server, "/models").build()).execute().use { r ->
+            if (r.isSuccessful) ModelSpec.parse(r.body!!.string()) else emptyList()
+        }
+    }.getOrDefault(emptyList())
 
     companion object {
         val JSON = "application/json".toMediaType()

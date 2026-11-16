@@ -100,6 +100,34 @@ class EndToEndTest {
         screenshot("05-einstellungen")
     }
 
+    /** Modellauswahl: Der Server (Modell-Gateway im Testmodus) bietet Qwen3 an, ein Projekt mit Qwen3 wird gestreamt. */
+    @Test
+    fun otherModelFromGateway() {
+        val c = container
+        val projectId = runBlocking {
+            val sid = c.servers.save("Mock-Server", "http://10.0.2.2:8080", "testkey")
+            c.servers.setActive(sid)
+            val id = c.projects.importText("Qwen-Probe", "Ein kurzer Satz [laugh] zum Testen. Und noch einer, damit es reicht.")
+            c.projects.updateSettings(id, de.tontaube.core.TtsSettings(model = de.tontaube.core.Models.QWEN3, instruct = "ruhig"))
+            id
+        }
+        waitFor("Server bereit", 15_000) { c.servers.status.value is de.tontaube.vorlesen.net.ServerStatus.Ready }
+        val models = (c.servers.status.value as de.tontaube.vorlesen.net.ServerStatus.Ready).models.map { it.id }
+        assertTrue("Modelle: $models", "qwen3" in models && "chatterbox" in models)
+
+        waitFor("Projekt in der Bibliothek", 15_000) { count("Qwen-Probe") > 0 }
+        compose.onAllNodes(hasText("Qwen-Probe")).onFirst().performClick()
+        waitFor("Projekt offen", 10_000) { compose.onAllNodes(hasContentDescription("Vorlesen")).fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodes(hasContentDescription("Vorlesen")).onFirst().performClick()
+        waitFor("Wiedergabe mit Qwen3", 60_000) { c.engine.state.value.let { it.isPlaying || it.error != null } }
+        assertTrue("Fehler: ${c.engine.state.value}", c.engine.state.value.error == null)
+        compose.onAllNodes(hasContentDescription("Pause")).onFirst().performClick()
+
+        compose.onAllNodes(hasContentDescription("Stimme und Einstellungen")).onFirst().performClick()
+        waitFor("Modellauswahl sichtbar", 10_000) { count("Modell") > 0 && count("Sprecher") > 0 }
+        screenshot("07-modell-qwen3")
+    }
+
     /** Wartet auf [cond]; bei Zeitüberschreitung schlägt der Test mit [what] und dem aktuellen Semantikbaum fehl. */
     private fun waitFor(what: String, timeoutMs: Long = 5_000, cond: () -> Boolean) {
         try {
