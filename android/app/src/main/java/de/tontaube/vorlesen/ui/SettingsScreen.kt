@@ -67,6 +67,7 @@ import androidx.media3.common.util.UnstableApi
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import de.tontaube.core.BufferPolicy
 import de.tontaube.core.ConnectLink
 import de.tontaube.core.TtsSettings
 import de.tontaube.vorlesen.BuildConfig
@@ -85,6 +86,8 @@ fun SettingsScreen(snackbar: SnackbarHostState) {
     val status by container.servers.status.collectAsStateWithLifecycle()
     val defaults by container.prefs.defaults.collectAsStateWithLifecycle(TtsSettings())
     val theme by container.prefs.theme.collectAsStateWithLifecycle("system")
+    val bufferMode by container.prefs.bufferMode.collectAsStateWithLifecycle(BufferPolicy.AUTO)
+    val playback by container.engine.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     var editing by remember { mutableStateOf<ServerEntity?>(null) }
     var adding by remember { mutableStateOf<ConnectLink?>(null) }
@@ -175,6 +178,40 @@ fun SettingsScreen(snackbar: SnackbarHostState) {
                     colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     trailingContent = { FilledTonalButton(onClick = { defaultsOpen = true }) { Text("Ändern") } },
                 )
+            }
+
+            item { HorizontalDivider(Modifier.padding(vertical = 8.dp)) }
+            item { SectionTitle("Wiedergabe") }
+            item {
+                val options = listOf(BufferPolicy.AUTO) + BufferPolicy.manualOptions
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                    Dropdown(
+                        label = "Vorpuffer",
+                        options = options.map { BufferPolicy.label(it) to it.toString() },
+                        value = bufferMode.toString(),
+                        onChange = { v -> scope.launch { container.prefs.setBufferMode(v.toInt()) } },
+                    )
+                    val factor = playback.realtimeFactor
+                    Text(
+                        if (bufferMode == BufferPolicy.AUTO) {
+                            "So viel Audio wird vorab erzeugt, bevor das Vorlesen startet oder nach einem Stocken weitergeht. " +
+                                "Automatisch richtet sich das nach der gemessenen Geschwindigkeit deines Servers: Ist er langsamer als Echtzeit, " +
+                                "wird länger gepuffert, damit danach etwa ${BufferPolicy.LISTEN_TARGET_S / 60} Minuten am Stück laufen. " +
+                                if (factor != null) {
+                                    "Zuletzt gemessen: ${BufferPolicy.describeFactor(factor)} → ${BufferPolicy.targetSeconds(BufferPolicy.AUTO, factor, start = false)} s Puffer."
+                                } else {
+                                    "Gemessen wird beim ersten Vorlesen."
+                                }
+                        } else {
+                            "Vor dem Start und nach jedem Stocken werden ${BufferPolicy.label(bufferMode)} Audio abgewartet. Mehr Puffer heißt: " +
+                                "länger warten, dafür seltener Unterbrechungen." +
+                                (factor?.let { " Gemessen: ${BufferPolicy.describeFactor(it)}." } ?: "")
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
             }
 
             item { HorizontalDivider(Modifier.padding(vertical = 8.dp)) }

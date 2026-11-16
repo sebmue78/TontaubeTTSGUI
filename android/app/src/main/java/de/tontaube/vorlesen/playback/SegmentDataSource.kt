@@ -48,7 +48,16 @@ fun interface SegmentResolver {
 class SegmentDataSource(
     private val api: TontaubeApi,
     private val resolver: SegmentResolver,
+    private val stats: LoadStats? = null,
 ) : BaseDataSource(/* isNetwork = */ true) {
+
+    /** Zähler für die Geschwindigkeitsmessung: Wird gerade vom Server gestreamt oder aus dem Speicher gelesen? */
+    class LoadStats {
+        val networkStreams = java.util.concurrent.atomic.AtomicInteger()
+        val cacheOpens = java.util.concurrent.atomic.AtomicLong()
+    }
+
+    private var countedNetwork = false
 
     private var uri: Uri? = null
     private var file: RandomAccessFile? = null
@@ -84,6 +93,7 @@ class SegmentDataSource(
             raf.seek(dataSpec.position)
             file = raf
             fileRemaining = (raf.length() - dataSpec.position).coerceAtLeast(0)
+            stats?.cacheOpens?.incrementAndGet()
             opened = true
             transferStarted(dataSpec)
             return fileRemaining
@@ -122,6 +132,8 @@ class SegmentDataSource(
             tmpFile = File.createTempFile("seg-" + dest.nameWithoutExtension + "-", ".part", dest.parentFile).also { tmpOut = FileOutputStream(it) }
         }
         opened = true
+        stats?.networkStreams?.incrementAndGet()
+        countedNetwork = true
         transferStarted(dataSpec)
         return C.LENGTH_UNSET.toLong()
     }
@@ -213,6 +225,10 @@ class SegmentDataSource(
         target = null
         streamDone = false
         receivedBytes = 0
+        if (countedNetwork) {
+            countedNetwork = false
+            stats?.networkStreams?.decrementAndGet()
+        }
         if (opened) {
             opened = false
             transferEnded()
@@ -220,10 +236,14 @@ class SegmentDataSource(
     }
 
     @UnstableApi
-    class Factory(private val api: TontaubeApi, private val resolver: SegmentResolver) : DataSource.Factory {
+    class Factory(
+        private val api: TontaubeApi,
+        private val resolver: SegmentResolver,
+        val stats: LoadStats? = null,
+    ) : DataSource.Factory {
         private val active = java.util.Collections.newSetFromMap(java.util.WeakHashMap<SegmentDataSource, Boolean>())
 
-        override fun createDataSource(): DataSource = SegmentDataSource(api, resolver).also { synchronized(active) { active += it } }
+        override fun createDataSource(): DataSource = SegmentDataSource(api, resolver, stats).also { synchronized(active) { active += it } }
 
         /** Alle laufenden Streams abbrechen (z. B. beim Springen an eine andere Stelle). */
         fun cancelAll() {
