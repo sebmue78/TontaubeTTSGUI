@@ -162,10 +162,17 @@ fun MainScreen(events: StateFlow<AppEvent?>, onEventHandled: () -> Unit) {
                             NavigationBarItem(
                                 selected = route == tab.route,
                                 onClick = {
-                                    nav.navigate(tab.route) {
-                                        popUpTo("library") { saveState = true }
-                                        launchSingleTop = true
-                                        restoreState = true
+                                    if (tab.route == "library") {
+                                        // Die Bibliothek ist der Start der Navigation: einfach dorthin zurück.
+                                        // (navigate + restoreState würde den beim Tabwechsel gesicherten Stapel
+                                        // der Bibliothek wiederherstellen – und damit wieder den zuletzt offenen Tab.)
+                                        nav.popBackStack("library", inclusive = false)
+                                    } else {
+                                        nav.navigate(tab.route) {
+                                            popUpTo("library") { saveState = true }
+                                            launchSingleTop = true
+                                            restoreState = true
+                                        }
                                     }
                                 },
                                 icon = { Icon(tab.icon, contentDescription = null) },

@@ -3,6 +3,7 @@ package de.tontaube.vorlesen
 import android.Manifest
 import android.graphics.Bitmap
 import android.os.Build
+import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -94,5 +95,23 @@ class EndToEndTest {
         compose.onAllNodes(hasContentDescription("Stimme und Einstellungen")).onFirst().performClick()
         compose.waitUntil(10_000) { compose.onAllNodes(hasText("Stil-Regler")).fetchSemanticsNodes().isNotEmpty() }
         screenshot("05-einstellungen")
+    }
+
+    /** Tabwechsel: Einstellungen → Bibliothek → Stimmen → Bibliothek muss jeweils den richtigen Bildschirm zeigen. */
+    @Test
+    fun bottomNavigationSwitchesTabs() {
+        fun tab(label: String) = compose.onAllNodes(hasText(label) and hasClickAction()).onFirst().performClick()
+        fun shows(title: String) = compose.waitUntil(5_000) { compose.onAllNodes(hasText(title)).fetchSemanticsNodes().size >= 2 }
+
+        compose.waitUntil(10_000) { compose.onAllNodes(hasText("Bibliothek")).fetchSemanticsNodes().isNotEmpty() }
+        repeat(2) {
+            tab("Einstellungen"); shows("Einstellungen")
+            tab("Bibliothek"); compose.waitUntil(5_000) { compose.onAllNodes(hasText("Importieren")).fetchSemanticsNodes().isNotEmpty() }
+            // Nur noch die Beschriftung in der Leiste – der Einstellungen-Bildschirm muss weg sein
+            compose.waitUntil(5_000) { compose.onAllNodes(hasText("Einstellungen")).fetchSemanticsNodes().size == 1 }
+            tab("Stimmen"); shows("Stimmen")
+            tab("Bibliothek"); compose.waitUntil(5_000) { compose.onAllNodes(hasText("Importieren")).fetchSemanticsNodes().isNotEmpty() }
+        }
+        screenshot("06-tabs")
     }
 }
