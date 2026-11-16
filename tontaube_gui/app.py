@@ -25,12 +25,16 @@ from .client import (
     DEFAULT_VOICE,
     STREAM_BITRATES,
     LANGUAGES,
+    MODELS,
     OUTPUT_FORMATS,
+    QWEN_SPEAKERS,
+    TURBO_TAGS,
     STYLE_TAGS,
     ControlSpec,
     SynthesisResult,
     TontaubeClient,
     TontaubeError,
+    build_model_payload,
     build_payload,
     concat_wav,
     load_voice_catalog,
@@ -38,7 +42,8 @@ from .client import (
 )
 
 MAX_CONTROL_SLOTS = 8
-N_FORM = 22  # Anzahl der Formularfelder vor den Regler-Slots (siehe build_ui: form)
+N_FORM = 28  # Anzahl der Formularfelder vor den Regler-Slots (siehe build_ui: form)
+QWEN_AUTO = "Automatisch (Klon oder Beschreibung)"
 VOICES = load_voice_catalog()
 
 
@@ -160,9 +165,17 @@ def check_server(url: str, api_key: str, timeout: float):
     else:
         lines.append(f"{len(VOICES)} mitgelieferte Stimmen verfügbar.")
         voice_update = gr.skip()
+    models = client.models()
+    if models:
+        names = ", ".join(str(m.get("name", m["id"])) for m in models)
+        lines.append(f"Modelle: {names}")
+        ids = {m["id"] for m in models}
+        model_update = gr.update(choices=[(k, v) for k, v in MODELS.items() if v in ids or v == "tontaube"])
+    else:
+        model_update = gr.update(choices=[(k, v) for k, v in MODELS.items() if v == "tontaube"], value="tontaube")
     if client.openapi():
         lines.append(f"API-Doku: {client.base_url}/docs")
-    return ("\n\n".join(lines), specs, voice_update, *_control_slot_updates(specs))
+    return ("\n\n".join(lines), specs, voice_update, model_update, *_control_slot_updates(specs))
 
 
 def _collect(
@@ -188,6 +201,12 @@ def _collect(
     top_k: str,
     frequency_penalty: str,
     acoustic_temperature: str,
+    model: str,
+    exaggeration: float,
+    cfg_weight: float,
+    qwen_speaker: str,
+    qwen_instruct: str,
+    qwen_ref_text: str,
     specs: list[ControlSpec],
     slot_values: list[Any],
     *,
@@ -227,6 +246,26 @@ def _collect(
     extra = _parse_json_field(extra_raw, "Zusätzliche Felder")
     if extra is not None and not isinstance(extra, dict):
         raise TontaubeError("Zusätzliche Felder: erwartet wird ein JSON-Objekt.")
+
+    if model and model != "tontaube":
+        if prefix:
+            raise TontaubeError("Fortsetzen gibt es nur mit Tontaube.")
+        return build_model_payload(
+            model,
+            text_value,
+            language=LANGUAGES.get(language, language) or None,
+            fmt=fmt if fmt in ("wav", "mp3") else "wav",
+            temperature=float(temperature) if temperature is not None else None,
+            voice_path=vpath,
+            voice_audio=voice_audio,
+            seed=_opt_num(seed, int, "Seed"),
+            exaggeration=float(exaggeration) if exaggeration is not None else None,
+            cfg_weight=float(cfg_weight) if cfg_weight is not None else None,
+            speaker=None if qwen_speaker in (None, "", QWEN_AUTO) else qwen_speaker,
+            instruct=qwen_instruct,
+            ref_text=qwen_ref_text,
+            extra=extra,
+        )
 
     return build_payload(
         text_value,
@@ -544,6 +583,30 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                     )
                     lan_newkey_btn = gr.Button("Neuen API-Key erzeugen", scale=1)
                 lan_info = gr.HTML(_lan_info_html(manager))
+            from .launcher import EXTRA_MODELS
+
+            with gr.Accordion("🧪 Weitere Modelle: Chatterbox und Qwen3-TTS", open=manager.models.enabled):
+                gr.Markdown(
+                    "Rechnen über **MLX** auf der Apple-GPU in einer eigenen Umgebung. Beim Einschalten werden "
+                    "einmalig die Pakete installiert (ca. 1 GB); die Modelle selbst (je 1–4 GB) lädt der Server "
+                    "beim ersten Gebrauch. Die Android-App findet sie unter derselben Adresse und mit demselben "
+                    "API-Key. **Tags** wie `[laugh]` versteht nur Chatterbox Turbo, und das nur auf Englisch."
+                )
+                with gr.Row():
+                    models_enabled = gr.Checkbox(manager.models.enabled, label="Weitere Modelle anbieten", scale=1)
+                    models_engines = gr.CheckboxGroup(
+                        [(label, key) for key, label in EXTRA_MODELS.items()],
+                        value=manager.models.engines,
+                        label="Modelle",
+                        scale=3,
+                    )
+                    models_qwen_size = gr.Radio(
+                        [("1.7B – bessere Qualität", "1.7B"), ("0.6B – schneller", "0.6B")],
+                        value=manager.models.qwen_size,
+                        label="Qwen3-Größe",
+                        scale=1,
+                    )
+                    models_apply = gr.Button("Übernehmen (Server startet neu)", scale=1)
             connected_state = gr.State(False)
             timer = gr.Timer(2.0)
             lan_timer = gr.Timer(10.0)
@@ -560,6 +623,13 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             with gr.Tab("Sprechen"):
                 with gr.Row():
                     with gr.Column(scale=3):
+                        model = gr.Dropdown(
+                            [(k, v) for k, v in MODELS.items() if v == "tontaube"],
+                            value="tontaube",
+                            label="Modell",
+                            info="Chatterbox und Qwen3-TTS erscheinen, wenn der Server sie anbietet "
+                            "(Desktop-App: „Weitere Modelle“ einschalten).",
+                        )
                         text = gr.Textbox(
                             label="Text",
                             lines=8,
@@ -576,6 +646,39 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                         with gr.Row():
                             temperature = gr.Slider(0.1, 1.5, value=0.7, step=0.05, label="Temperatur")
                             system_tag = gr.Checkbox(True, label="Sprache/Stil an Modell senden (use_system_tag)")
+
+                        with gr.Group(visible=False) as turbo_group:
+                            gr.Markdown(
+                                "**Tags** (nur Chatterbox Turbo, nur Englisch): an der Stelle im Text einfügen, "
+                                "an der gelacht, geseufzt usw. werden soll."
+                            )
+                            with gr.Row():
+                                tag_buttons = [gr.Button(t, size="sm", min_width=60) for t in TURBO_TAGS]
+                        with gr.Group(visible=False) as cb_group:
+                            with gr.Row():
+                                exaggeration = gr.Slider(
+                                    0.25, 2.0, value=0.5, step=0.05, label="Emotion (exaggeration)",
+                                    info="0,5 = neutral, höher = ausdrucksstärker und schneller",
+                                )
+                                cfg_weight = gr.Slider(
+                                    0.0, 1.0, value=0.5, step=0.05, label="Führung (cfg_weight)",
+                                    info="niedriger = ruhiger; bei hoher Emotion etwa 0,3",
+                                )
+                        with gr.Group(visible=False) as qwen_group:
+                            with gr.Row():
+                                qwen_speaker = gr.Dropdown(
+                                    [QWEN_AUTO, *QWEN_SPEAKERS], value=QWEN_AUTO, label="Qwen3-Sprecher",
+                                    info="Fertige Sprecher (keiner ist deutscher Muttersprachler). Automatisch: "
+                                    "Klon bei eigener/mitgelieferter Stimme, sonst Stimme aus der Beschreibung.",
+                                )
+                                qwen_instruct = gr.Textbox(
+                                    "", label="Stil-Anweisung bzw. Stimmbeschreibung",
+                                    placeholder="z. B. „Ruhig und warm, wie ein Hörbuchsprecher“ oder "
+                                    "„Tiefe, raue Männerstimme, etwa 60 Jahre“",
+                                )
+                            qwen_ref_text = gr.Textbox(
+                                "", label="Transkript des Referenzaudios (optional, verbessert den Klon)",
+                            )
 
                         gr.Markdown("#### Stimme")
                         voice_mode = gr.Radio(
@@ -596,33 +699,34 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                         )
                         voice_hint = gr.Markdown(visible=False)
 
-                        gr.Markdown("#### Stil-Regler")
-                        slot_components: list[gr.components.Component] = []
-                        for i in range(MAX_CONTROL_SLOTS):
-                            spec = DEFAULT_CONTROLS[i] if i < len(DEFAULT_CONTROLS) else None
-                            with gr.Row(elem_classes="control-row"):
-                                cb = gr.Checkbox(
-                                    False,
-                                    label=f"{spec.display_label} festlegen" if spec else "",
-                                    visible=spec is not None,
-                                    scale=1,
-                                    min_width=160,
-                                )
-                                sl = gr.Slider(
-                                    spec.minimum if spec else 0,
-                                    spec.maximum if spec else 4,
-                                    value=((spec.minimum + spec.maximum) // 2) if spec else 2,
-                                    step=1,
-                                    label=spec.display_label if spec else "",
-                                    info=f"{spec.name}: Stufen {spec.minimum}–{spec.maximum}. {spec.description}"
-                                    if spec
-                                    else None,
-                                    interactive=False,
-                                    visible=spec is not None,
-                                    scale=4,
-                                )
-                            cb.change(lambda on: gr.update(interactive=on), cb, sl)
-                            slot_components += [cb, sl]
+                        with gr.Column() as controls_title:
+                            gr.Markdown("#### Stil-Regler")
+                            slot_components: list[gr.components.Component] = []
+                            for i in range(MAX_CONTROL_SLOTS):
+                                spec = DEFAULT_CONTROLS[i] if i < len(DEFAULT_CONTROLS) else None
+                                with gr.Row(elem_classes="control-row"):
+                                    cb = gr.Checkbox(
+                                        False,
+                                        label=f"{spec.display_label} festlegen" if spec else "",
+                                        visible=spec is not None,
+                                        scale=1,
+                                        min_width=160,
+                                    )
+                                    sl = gr.Slider(
+                                        spec.minimum if spec else 0,
+                                        spec.maximum if spec else 4,
+                                        value=((spec.minimum + spec.maximum) // 2) if spec else 2,
+                                        step=1,
+                                        label=spec.display_label if spec else "",
+                                        info=f"{spec.name}: Stufen {spec.minimum}–{spec.maximum}. {spec.description}"
+                                        if spec
+                                        else None,
+                                        interactive=False,
+                                        visible=spec is not None,
+                                        scale=4,
+                                    )
+                                cb.change(lambda on: gr.update(interactive=on), cb, sl)
+                                slot_components += [cb, sl]
 
                         with gr.Accordion("Erweitert", open=False):
                             with gr.Row():
@@ -740,10 +844,27 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
 
         voice_audio.change(on_voice_audio, voice_audio, voice_hint)
 
+        def on_model(m):
+            tt = m in (None, "", "tontaube")
+            updates = [
+                gr.update(visible=tt),  # style
+                gr.update(visible=tt),  # system_tag
+                gr.update(visible=m == "chatterbox-turbo"),
+                gr.update(visible=m in ("chatterbox", "chatterbox-turbo")),
+                gr.update(visible=m == "qwen3"),
+                gr.update(visible=tt),  # controls_title
+                gr.update(interactive=tt),  # continue_btn
+                gr.update(value="Englisch") if m == "chatterbox-turbo" else gr.update(),
+            ]
+            return updates
+
+        for b in tag_buttons:
+            b.click(lambda t, tag=b.value: f"{(t or '').rstrip()} {tag} ".lstrip(), text, text)
+
         check_btn.click(
             check_server,
             [url, api_key, timeout],
-            [server_status, specs_state, voice_path, *slot_components],
+            [server_status, specs_state, voice_path, model, *slot_components],
         )
 
         form = [
@@ -769,6 +890,12 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             top_k,
             frequency_penalty,
             acoustic_temperature,
+            model,
+            exaggeration,
+            cfg_weight,
+            qwen_speaker,
+            qwen_instruct,
+            qwen_ref_text,
             *slot_components,
         ]
         outputs = [
@@ -782,6 +909,10 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             history_files,
         ]
         common = [url, api_key, timeout, specs_state, history_state, last_state]
+        model.change(
+            on_model, model,
+            [style, system_tag, turbo_group, cb_group, qwen_group, controls_title, continue_btn, language],
+        )
         speak_btn.click(synthesize, common + form, outputs, concurrency_limit=4)
         text.submit(synthesize, common + form, outputs, concurrency_limit=4)
         continue_btn.click(synthesize_continue, common + form, outputs, concurrency_limit=4)
@@ -797,7 +928,7 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
         clear_btn.click(clear_history, None, [history_state, last_state, history_table, history_files])
 
         if manager is not None:
-            check_outputs = [server_status, specs_state, voice_path, *slot_components]
+            check_outputs = [server_status, specs_state, voice_path, model, *slot_components]
 
             def tick(connected, key, tmo):
                 ready = manager.state.phase == "ready"
@@ -836,6 +967,14 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                 return _lan_info_html(manager), gr.skip()
 
             lan_enabled.input(on_lan_toggle, lan_enabled, [lan_info, connected_state])
+
+            def on_models_apply(enabled, engines, size):
+                if manager.set_models(bool(enabled), list(engines or []), size):
+                    _restart_for_network()
+                    return False
+                return gr.skip()
+
+            models_apply.click(on_models_apply, [models_enabled, models_engines, models_qwen_size], connected_state)
             lan_newkey_btn.click(on_new_key, None, [lan_info, connected_state])
             lan_timer.tick(lambda: _lan_info_html(manager), None, lan_info, show_progress="hidden")
 

@@ -61,6 +61,8 @@ def _wav(pcm: bytes) -> bytes:
 
 
 def _text(body: dict) -> str:
+    if "model" in body:  # wie der echte Server (pydantic extra="forbid")
+        raise HTTPException(422, "extra field 'model' not permitted")
     t = body.get("text", "")
     t = " ".join(t) if isinstance(t, list) else str(t)
     if not t.strip():

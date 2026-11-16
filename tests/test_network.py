@@ -48,3 +48,16 @@ def test_server_env_lan(tmp_path):
     assert env["REQUIRE_API_KEY"] == "1" and env["TTS_API_KEY"] == m.network.api_key
     assert NetworkSettings.load(tmp_path / "network.json").enabled
     assert m.client_key == ""  # Server läuft noch nicht im LAN-Modus
+
+
+def test_model_settings_and_restart_flag(tmp_path):
+    from tontaube_gui.launcher import EXTRA_MODELS, ModelSettings
+
+    m = ServerManager(home=tmp_path)
+    assert not m.models.enabled and m.models.engines == list(EXTRA_MODELS)
+    assert m.set_models(True, ["qwen3", "bogus"], "0.6B")
+    loaded = ModelSettings.load(tmp_path / "models.json")
+    assert loaded.enabled and loaded.engines == ["qwen3"] and loaded.qwen_size == "0.6B"
+    env = m._gateway_env([], 8080, 8180, lan=False)
+    assert env["GATEWAY_UPSTREAM"] == "http://127.0.0.1:8180" and env["GATEWAY_ENGINES"] == "qwen3"
+    assert "TTS_API_KEY" not in env

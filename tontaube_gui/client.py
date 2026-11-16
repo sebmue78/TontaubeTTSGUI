@@ -45,6 +45,56 @@ STYLE_TAGS: dict[str, str] = {
 }
 
 OUTPUT_FORMATS = ["wav", "mp3", "opus"]
+
+# Modelle hinter dem Modell-Gateway (Anzeige → Feld ``model``). "tontaube" wird nicht mitgeschickt.
+MODELS: dict[str, str] = {
+    "Tontaube V1.1": "tontaube",
+    "Chatterbox Multilingual (Deutsch, Emotion)": "chatterbox",
+    "Chatterbox Turbo (nur Englisch, Tags)": "chatterbox-turbo",
+    "Qwen3-TTS (Deutsch, Stil-Anweisung)": "qwen3",
+}
+TURBO_TAGS = ["[laugh]", "[chuckle]", "[sigh]", "[gasp]", "[cough]", "[clear throat]", "[sniff]", "[groan]",
+              "[shush]"]
+QWEN_SPEAKERS = ["Ryan", "Aiden", "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee"]
+
+
+def build_model_payload(
+    model: str,
+    text: str | list[str],
+    *,
+    language: str | None = None,
+    fmt: str | None = "wav",
+    temperature: float | None = None,
+    voice_path: str | None = None,
+    voice_audio: bytes | None = None,
+    seed: int | None = None,
+    exaggeration: float | None = None,
+    cfg_weight: float | None = None,
+    speaker: str | None = None,
+    instruct: str | None = None,
+    ref_text: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Body für Chatterbox/Qwen3 über das Modell-Gateway (nur die Felder, die diese Modelle kennen)."""
+    if isinstance(text, list):
+        text = "\n\n".join(t for t in text if t.strip())
+    if not (text or "").strip():
+        raise TontaubeError("Bitte einen Text eingeben.")
+    payload: dict[str, Any] = {"model": model, "text": text}
+    optional: dict[str, Any] = {"language": language, "format": fmt, "temperature": temperature, "seed": seed}
+    if model.startswith("chatterbox"):
+        optional.update(exaggeration=exaggeration, cfg_weight=cfg_weight)
+    if model == "qwen3":
+        optional.update(speaker=speaker or None, instruct=(instruct or "").strip() or None,
+                        ref_text=(ref_text or "").strip() or None)
+    payload.update({k: v for k, v in optional.items() if v is not None})
+    if voice_audio:
+        payload["voice_audio_b64"] = base64.b64encode(voice_audio).decode("ascii")
+    elif voice_path:
+        payload["voice_path"] = voice_path
+    if extra:
+        payload.update(extra)
+    return payload
 STREAM_BITRATES = ["32k", "64k", "96k", "128k"]
 
 _LANG_CODES = {"en": "english", "de": "german", "es": "spanish", "fr": "french", "it": "italian",
@@ -368,6 +418,21 @@ class TontaubeClient:
         except ValueError as exc:
             raise TontaubeError("Antwort von /controls ist kein JSON.") from exc
         return specs
+
+    def models(self) -> list[dict[str, Any]]:
+        """Modelle laut ``GET /models`` (nur mit Modell-Gateway); leer bei reinem Tontaube-Server."""
+        try:
+            resp = self._get("/models", timeout=5)
+        except TontaubeError:
+            return []
+        if not resp.ok:
+            return []
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+        models = data.get("models") if isinstance(data, dict) else None
+        return [m for m in models or [] if isinstance(m, dict) and m.get("id")]
 
     def voices(self) -> list[str]:
         """Versucht, die mitgelieferten Stimmen vom Server zu lesen.
