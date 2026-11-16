@@ -1,0 +1,153 @@
+name: Release
+
+# Versionierte Releases für macOS-App (DMG) und Android-App (APK) mit gemeinsamer Versionsnummer.
+#
+# Zwei Wege:
+#  1. Auf GitHub: Actions → „Release“ → „Run workflow“, Branch wählen, Version eintragen (z. B. 0.3.0).
+#     Der Workflow setzt VERSION, macht aus „Unveröffentlicht“ im CHANGELOG den Abschnitt der Version,
+#     committet das auf den Branch, setzt den Tag v0.3.0, baut, testet und veröffentlicht.
+#  2. Lokal: `python tools/release.py bump 0.3.0`, committen, `git tag v0.3.0`, Tag pushen.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Neue Version ohne „v“, z. B. 0.3.0 (Vorabversion: 0.3.0-beta.1)"
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Version festlegen
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      sha: ${{ steps.v.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Version setzen, committen und taggen (manueller Start)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" != "branch" ]; then echo "::error::Bitte einen Branch auswählen, keinen Tag."; exit 1; fi
+          VERSION="${VERSION#v}"
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION existiert schon."; exit 1
+          fi
+          python3 tools/release.py bump "$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Release v$VERSION"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
+          git tag -a "v$VERSION" -m "Tontaube TTS $VERSION"
+          git push origin "v$VERSION"
+
+      - name: Tag prüfen und Version ausgeben
+        id: v
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            VERSION="$(python3 tools/release.py check "$GITHUB_REF_NAME")"
+          else
+            VERSION="$(cat VERSION | tr -d '[:space:]')"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Release $VERSION aus $(git rev-parse --short HEAD), Android-versionCode $(python3 tools/release.py version-code "$VERSION")"
+
+  macos:
+    name: macOS-App
+    needs: prepare
+    uses: ./.github/workflows/macos-app.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      release: true
+
+  android:
+    name: Android-App
+    needs: prepare
+    uses: ./.github/workflows/android-app.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      release: true
+
+  publish:
+    name: Auf GitHub veröffentlichen
+    needs: [prepare, macos, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SHA: ${{ needs.prepare.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Tontaube-TTS-dmg
+          path: dl/macos
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Tontaube-Vorlesen-apk
+          path: dl/android
+
+      - name: Dateien benennen und Prüfsummen
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp dl/macos/Tontaube-TTS.dmg "out/Tontaube-TTS-$VERSION-macOS-AppleSilicon.dmg"
+          cp dl/android/Tontaube-Vorlesen.apk "out/Tontaube-Vorlesen-$VERSION-Android.apk"
+          (cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Release-Notizen
+        run: |
+          set -euo pipefail
+          {
+            python3 tools/release.py notes "$VERSION"
+            cat <<'NOTES'
+
+          ---
+
+          ### Installieren
+
+          **macOS (Apple Silicon, ab macOS 13):** `Tontaube-TTS-…-macOS-AppleSilicon.dmg` öffnen, die App in den Programme-Ordner ziehen, beim ersten Öffnen Rechtsklick → Öffnen. Der erste Start lädt Server und Modelle (ca. 8,6 GB).
+
+          **Android (ab Android 8):** `Tontaube-Vorlesen-…-Android.apk` auf dem Handy öffnen und installieren (einmalig „Installation aus unbekannten Quellen“ erlauben). Neue Versionen lassen sich über die alte installieren.
+          NOTES
+          } > notes.md
+          cat notes.md
+
+      - name: GitHub-Release anlegen
+        run: |
+          set -euo pipefail
+          FLAGS=(--latest)
+          case "$VERSION" in *-*) FLAGS=(--prerelease --latest=false) ;; esac
+          gh release create "v$VERSION" out/* \
+            --verify-tag \
+            --title "Tontaube TTS $VERSION" \
+            --notes-file notes.md \
+            "${FLAGS[@]}"

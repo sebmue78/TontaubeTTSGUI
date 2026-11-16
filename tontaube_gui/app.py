@@ -19,6 +19,7 @@ from typing import Any
 
 import gradio as gr
 
+from . import __version__
 from .client import (
     DEFAULT_CONTROLS,
     DEFAULT_SERVER_URL,
@@ -542,7 +543,7 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
         last_state = gr.State(None)
 
         gr.Markdown("# 🕊️ Tontaube TTS", elem_id="title")
-        gr.Markdown("Oberfläche für **TontaubeV1.1** · mehrsprachige Sprachsynthese mit Voice Cloning")
+        gr.Markdown(f"Oberfläche für **TontaubeV1.1** · mehrsprachige Sprachsynthese mit Voice Cloning · Version {__version__}")
 
         if manager is not None:
             with gr.Group():

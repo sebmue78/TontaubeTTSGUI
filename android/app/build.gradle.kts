@@ -14,8 +14,15 @@ android {
         applicationId = "de.tontaube.vorlesen"
         minSdk = 26
         targetSdk = 35
-        versionCode = (System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1)
-        versionName = "1.0." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
+        // Gemeinsame Versionsnummer mit der macOS-App aus der Datei VERSION im Repository.
+        // versionCode = MAJOR·1 000 000 + MINOR·1 000 + PATCH (wie tools/release.py version-code).
+        // BUILD_SUFFIX (z. B. "-dev.42") kennzeichnet Entwicklungs-Builds aus der CI.
+        val appVersion = rootProject.file("../VERSION").readText().trim()
+        val (major, minor, patch) = Regex("""^(\d+)\.(\d+)\.(\d+)""").find(appVersion)
+            ?.destructured?.toList()?.map { it.toInt() }
+            ?: error("VERSION ungültig: $appVersion")
+        versionCode = major * 1_000_000 + minor * 1_000 + patch
+        versionName = appVersion + (System.getenv("BUILD_SUFFIX") ?: "")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
