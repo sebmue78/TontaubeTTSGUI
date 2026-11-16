@@ -126,6 +126,9 @@ class EndToEndTest {
         compose.onAllNodes(hasContentDescription("Stimme und Einstellungen")).onFirst().performClick()
         waitFor("Modellauswahl sichtbar", 10_000) { count("Modell") > 0 && count("Sprecher") > 0 }
         screenshot("07-modell-qwen3")
+        // Aufräumen: Auf dem kleinen Emulator-Bildschirm würde ein zweites Projekt in der Liste unter dem
+        // Import-Knopf landen und den anderen Test stören.
+        runBlocking { c.projects.delete(projectId) }
     }
 
     /** Wartet auf [cond]; bei Zeitüberschreitung schlägt der Test mit [what] und dem aktuellen Semantikbaum fehl. */
