@@ -24,3 +24,4 @@ Erste versionierte Veröffentlichung.
 - Verbindung zur Desktop-App per QR-Code.
 - Tipp auf „Bibliothek“ öffnet wieder die Bibliothek statt des zuletzt gewählten Tabs.
 - Vorlese-Abschnitte enden immer an einem Satzende.
+- Vorpuffer passt sich automatisch an die Geschwindigkeit des Servers an oder lässt sich fest einstellen (30 s bis 10 min), damit es keine ständigen kurzen Aussetzer gibt.
