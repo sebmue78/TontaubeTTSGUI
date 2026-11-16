@@ -23,3 +23,4 @@ Erste versionierte Veröffentlichung.
 - Eigene Stimmen aufnehmen oder wählen, 39 mitgelieferte Stimmen mit Hörprobe.
 - Verbindung zur Desktop-App per QR-Code.
 - Tipp auf „Bibliothek“ öffnet wieder die Bibliothek statt des zuletzt gewählten Tabs.
+- Vorlese-Abschnitte enden immer an einem Satzende.
