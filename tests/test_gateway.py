@@ -75,7 +75,7 @@ def test_job_variants():
         gw.parse_job({"model": "chatterbox-turbo", "text": "Hallo", "language": "german"}, s)
     with pytest.raises(gw.RequestError):
         gw.parse_job({"model": "qwen3", "text": "Hallo", "language": "dutch"}, s)
-    job = gw.parse_job({"model": "chatterbox", "text": "Hi", "exaggeration": 9}, s)
+    job = gw.parse_job({"model": "chatterbox", "text": "Hi", "exaggeration": 9, "voice_audio_b64": b64}, s)
     assert job.params["exaggeration"] == 2.0 and job.language == "german"
 
 
@@ -162,3 +162,21 @@ def test_tontaube_only_server_has_no_models():
     finally:
         server.should_exit = True
         t.join(5)
+
+
+def test_chatterbox_without_voice_uses_bundled_voice_of_language(tmp_path):
+    import json
+
+    (tmp_path / "samples").mkdir()
+    for name in ("Juri.mp3", "Oskar.mp3", "Marcus.mp3", "Anna.mp3"):
+        (tmp_path / "samples" / name).write_bytes(name.encode())
+    (tmp_path / "manifest.json").write_text(json.dumps({"voices": {
+        "Oskar.mp3": {"language": "de"}, "Juri.mp3": {"language": "de"}, "Anna.mp3": {"language": "fr"},
+        "Marcus.mp3": {"language": "en"}}}))
+    s = gw.Settings(voices_dir=tmp_path.resolve())
+    assert gw.parse_job({"model": "chatterbox", "text": "Hallo"}, s).ref_audio == b"Juri.mp3"
+    assert gw.parse_job({"model": "chatterbox", "text": "Salut", "language": "french"}, s).ref_audio == b"Anna.mp3"
+    assert gw.parse_job({"model": "chatterbox", "text": "Hola", "language": "spanish"}, s).ref_audio == b"Marcus.mp3"
+    assert gw.parse_job({"model": "qwen3", "text": "Hallo"}, s).ref_audio is None
+    with pytest.raises(gw.RequestError):
+        gw.parse_job({"model": "chatterbox", "text": "Hallo"}, gw.Settings())

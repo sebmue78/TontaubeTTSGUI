@@ -93,7 +93,8 @@ MODELS: dict[str, dict[str, Any]] = {
     "chatterbox": {
         "id": "chatterbox",
         "name": "Chatterbox Multilingual",
-        "description": "Resemble AI, 23 Sprachen inkl. Deutsch, Stimmen klonen, Emotions-Regler. Keine Tags.",
+        "description": "Resemble AI, 23 Sprachen inkl. Deutsch, Stimmen klonen, Emotions-Regler. Keine Tags. "
+                       "Ohne gewählte Stimme spricht eine mitgelieferte Stimme der Sprache (z. B. Juri).",
         "license": "MIT",
         "languages": [lang for lang in CHATTERBOX_LANGS],
         "voice_cloning": True,
@@ -341,6 +342,23 @@ def _num(body: dict, key: str, lo: float, hi: float) -> float | None:
     return min(hi, max(lo, f))
 
 
+def default_voice(voices_dir: Path | None, language: str) -> Path | None:
+    """Mitgelieferte Tontaube-Stimme für eine Sprache (``voices/manifest.json``), sonst Marcus."""
+    if voices_dir is None:
+        return None
+    iso = CHATTERBOX_LANGS.get(language, "")
+    try:
+        manifest = json.loads((voices_dir / "manifest.json").read_text(encoding="utf-8")).get("voices") or {}
+    except (OSError, ValueError, AttributeError):
+        manifest = {}
+    names = sorted(n for n, m in manifest.items() if isinstance(m, dict) and m.get("language") == iso)
+    for name in [*names, "Marcus.mp3"]:
+        path = voices_dir / "samples" / name
+        if path.is_file():
+            return path
+    return None
+
+
 def parse_job(body: dict, settings: Settings) -> Job:
     model = str(body.get("model") or "")
     if model not in settings.engines:
@@ -369,6 +387,15 @@ def parse_job(body: dict, settings: Settings) -> Job:
         path = (settings.voices_dir / str(body["voice_path"])).resolve()
         if settings.voices_dir not in path.parents or not path.is_file():
             raise RequestError(f"Stimme '{body['voice_path']}' nicht gefunden.")
+        ref = path.read_bytes()
+        ref_key = f"path:{path}:{path.stat().st_mtime_ns}"
+
+    if ref is None and model == "chatterbox":
+        # Das MLX-Repo von Chatterbox Multilingual bringt keine Standardstimme mit (conds.safetensors fehlt):
+        # ohne gewählte Stimme eine mitgelieferte Tontaube-Stimme der passenden Sprache als Referenz nehmen.
+        path = default_voice(settings.voices_dir, language)
+        if path is None:
+            raise RequestError("Chatterbox Multilingual braucht eine Stimme (mitgelieferte oder eigene).")
         ref = path.read_bytes()
         ref_key = f"path:{path}:{path.stat().st_mtime_ns}"
 
