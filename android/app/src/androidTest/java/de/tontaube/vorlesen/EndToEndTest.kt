@@ -112,17 +112,17 @@ class EndToEndTest {
 
     private fun count(text: String) = compose.onAllNodes(hasText(text)).fetchSemanticsNodes().size
 
-    /** Tabwechsel: Einstellungen → Bibliothek → Stimmen → Bibliothek muss jeweils den richtigen Bildschirm zeigen. */
+    /** Tabwechsel (Bildschirm erkennbar am Titel; der Tab-Name steht zusätzlich in der Leiste): Einstellungen → Bibliothek → Stimmen → Bibliothek muss jeweils den richtigen Bildschirm zeigen. */
     @Test
     fun bottomNavigationSwitchesTabs() {
         fun tab(label: String) = compose.onAllNodes(hasText(label) and hasClickAction()).onFirst().performClick()
 
-        waitFor("Start", 10_000) { count("Importieren") > 0 }
+        waitFor("Start", 10_000) { count("Bibliothek") >= 2 }
         repeat(2) { round ->
-            tab("Einstellungen"); waitFor("Einstellungen offen ($round)") { count("Einstellungen") >= 2 && count("Importieren") == 0 }
-            tab("Bibliothek"); waitFor("zurück in der Bibliothek ($round)") { count("Importieren") > 0 && count("Einstellungen") == 1 }
-            tab("Stimmen"); waitFor("Stimmen offen ($round)") { count("Stimmen") >= 2 && count("Importieren") == 0 }
-            tab("Bibliothek"); waitFor("wieder in der Bibliothek ($round)") { count("Importieren") > 0 && count("Stimmen") == 1 }
+            tab("Einstellungen"); waitFor("Einstellungen offen ($round)") { count("Einstellungen") >= 2 && count("Bibliothek") == 1 }
+            tab("Bibliothek"); waitFor("zurück in der Bibliothek ($round)") { count("Bibliothek") >= 2 && count("Einstellungen") == 1 }
+            tab("Stimmen"); waitFor("Stimmen offen ($round)") { count("Stimmen") >= 2 && count("Bibliothek") == 1 }
+            tab("Bibliothek"); waitFor("wieder in der Bibliothek ($round)") { count("Bibliothek") >= 2 && count("Stimmen") == 1 }
         }
         screenshot("06-tabs")
     }
