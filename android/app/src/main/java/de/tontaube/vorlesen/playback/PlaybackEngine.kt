@@ -182,11 +182,12 @@ class PlaybackEngine(
     fun open(projectId: Long, segmentIndex: Int? = null, positionMs: Long? = null, play: Boolean = true) {
         scope.launch {
             if (project?.id != projectId) savePosition()
-            val p = projects.get(projectId) ?: return@launch
+            // Text zuerst laden: ältere Projekte werden dabei neu aufgeteilt und ihre Position umgerechnet
             val t = runCatching { projects.textAsync(projectId) }.getOrElse {
                 _state.update { s -> s.copy(error = "Der Text des Projekts konnte nicht geladen werden.") }
                 return@launch
             }
+            val p = projects.get(projectId) ?: return@launch
             if (t.segments.isEmpty()) {
                 _state.update { s -> s.copy(error = "Das Projekt enthält keinen vorlesbaren Text.") }
                 return@launch

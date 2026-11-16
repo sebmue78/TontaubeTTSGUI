@@ -40,6 +40,68 @@ class SegmenterTest {
         assertTrue(parts.size > 1 && parts.all { it.length <= 160 })
     }
 
+    private val endsSentence = Regex("[.!?…][\"»«“”'’)\\]]*$")
+
+    @Test
+    fun paragraphBrokenMidSentenceDoesNotEndSegment() {
+        // Wie aus einem PDF: Seitenumbruch mitten im Satz erzeugt zwei „Absätze“
+        val a = (1..3).joinToString(" ") { "Das ist der vollständige Satz Nummer $it." } + " Und dieser Satz wird vom Seitenumbruch"
+        val b = "mitten im Wort getrennt und geht hier weiter. Danach kommt noch ein Satz."
+        val doc = ParsedDocument("T", null, listOf(Chapter(null, listOf(a, b))), DocumentFormat.PDF)
+        val out = seg.segment(doc).segments.map { it.text }
+        assertTrue(out.toString(), out.all { endsSentence.containsMatchIn(it) })
+        assertTrue(out.toString(), out.any { "Seitenumbruch mitten im Wort" in it })
+    }
+
+    @Test
+    fun everySegmentEndsAtSentenceEnd() {
+        val paragraphs = listOf(
+            "Überschrift ohne Punkt",
+            (1..9).joinToString(" ") { "Ein mittellanger Satz mit der Nummer $it, damit es etwas Text gibt." },
+            "Eine Zeile, die umbrochen wurde",
+            "und erst hier endet.",
+            "„Kurz!“",
+            "Noch ein Absatz mit einem Satz. Und einem zweiten Satz.",
+        )
+        val out = seg.segment(ParsedDocument("T", null, listOf(Chapter(null, paragraphs)), DocumentFormat.TXT)).segments.map { it.text }
+        assertTrue(out.toString(), out.all { endsSentence.containsMatchIn(it) })
+        assertTrue(out.toString(), out.all { it.length <= 160 })
+        assertTrue(out.toString(), out.any { "umbrochen wurde und erst hier endet." in it })
+        assertTrue(out.first().startsWith("Überschrift ohne Punkt\n"))
+        val joined = out.joinToString(" ").replace(Regex("\\s+"), " ")
+        assertEquals(paragraphs.joinToString(" ").replace(Regex("\\s+"), " "), joined)
+    }
+
+    @Test
+    fun overlongSentenceInDocumentIsCutAtPunctuation() {
+        val sentence = (1..30).joinToString(", ") { "Teil $it des Satzes" } + "."
+        val out = seg.segment(ParsedDocument("T", null, listOf(Chapter(null, listOf(sentence))), DocumentFormat.TXT)).segments.map { it.text }
+        assertTrue(out.size > 1 && out.all { it.length <= 160 })
+        assertTrue(out.toString(), out.dropLast(1).all { it.endsWith(",") })
+        assertTrue(out.last().endsWith("."))
+    }
+
+    @Test
+    fun resegmentsOldProjectsAndMapsPosition() {
+        // Alte Aufteilung: Abschnitt endet mitten im Satz
+        val old = SegmentedText(
+            listOf(
+                Segment(0, "Erster Satz. Zweiter Satz, der hier"),
+                Segment(0, "weitergeht und endet. Dritter Satz steht hier."),
+                Segment(1, "Kapitel zwei beginnt. Es hat genau zwei Sätze."),
+            ),
+            listOf(ChapterInfo("Eins", 0), ChapterInfo("Zwei", 2)),
+        )
+        val (fresh, map) = seg.resegment(old)
+        assertEquals(Segmenter.VERSION, fresh.version)
+        assertTrue(fresh.segments.toString(), fresh.segments.all { endsSentence.containsMatchIn(it.text) })
+        assertTrue(fresh.segments.any { "der hier weitergeht" in it.text })
+        assertEquals(listOf("Eins", "Zwei"), fresh.chapters.map { it.title })
+        assertEquals(3, map.size)
+        assertEquals(fresh.chapters[1].firstSegment, map[2])
+        assertTrue(map[0] <= map[1] && map[1] < map[2])
+    }
+
     @Test
     fun progress() {
         val st = SegmentedText(listOf(Segment(0, "aaaa"), Segment(0, "bbbb")), listOf(ChapterInfo("x", 0)))
