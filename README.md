@@ -39,8 +39,8 @@ Den Fortschritt zeigt die Oberfläche oben an. Ab dem zweiten Start ist sie nach
 
 ### Installation (fertiges DMG)
 
-1. Neueste Version laden: [Releases → macos-latest](https://github.com/sebmue78/TontaubeTTSGUI/releases/tag/macos-latest) → `Tontaube-TTS.dmg`
-   (wird bei jedem Push automatisch auf einem Apple-Silicon-Runner gebaut und getestet).
+1. Neueste Version laden: [Releases → neueste Version](https://github.com/sebmue78/TontaubeTTSGUI/releases/latest) → `Tontaube-TTS-X.Y.Z-macOS-AppleSilicon.dmg`
+   (auf einem Apple-Silicon-Runner gebaut und getestet, siehe [Versionen und Releases](#versionen-und-releases)).
 2. DMG öffnen und **Tontaube TTS** in den Ordner **Programme** ziehen.
 3. Beim ersten Öffnen: Rechtsklick → **Öffnen** (die App ist nicht notarisiert).
 
@@ -112,9 +112,9 @@ vorliest. Quellcode in [`android/`](android/), Kotlin + Jetpack Compose (Materia
 | **Eigene Stimmen** | In der App aufnehmen (5–60 s) oder Audiodatei wählen. Wird lokal gespeichert und bei jeder Anfrage als `voice_audio_b64` mitgeschickt (der Server merkt sich den Stimmen-Prompt). Die 39 mitgelieferten Stimmen sind ebenfalls wählbar, jeweils mit Hörprobe. |
 | **Server** | Verbindung per QR-Code aus der Desktop-App oder manuell (Adresse + API-Key), mehrere Server, Verbindungstest. |
 
-**Installieren:** [Releases → android-latest](https://github.com/sebmue78/TontaubeTTSGUI/releases/tag/android-latest)
-→ `Tontaube-Vorlesen.apk` auf dem Handy öffnen (einmalig „Installation aus unbekannten Quellen“ erlauben).
-Die APK wird bei jedem Push von GitHub Actions gebaut und getestet.
+**Installieren:** [Releases → neueste Version](https://github.com/sebmue78/TontaubeTTSGUI/releases/latest)
+→ `Tontaube-Vorlesen-X.Y.Z-Android.apk` auf dem Handy öffnen (einmalig „Installation aus unbekannten Quellen“ erlauben).
+Die Versionsnummer steht in der App unter **Einstellungen**.
 
 **Verbinden:** In der Desktop-App unter **📱 Im Netzwerk freigeben (Android-App)** den Schalter aktivieren
 (der Server startet dafür neu und bindet an alle Netzwerkschnittstellen, mit API-Key-Pflicht). In der
@@ -126,6 +126,30 @@ rechnet der Mac langsamer als Echtzeit, dann entstehen beim Streamen Pausen; auf
 
 Selbst bauen (Android-SDK nötig): `cd android && ./gradlew :app:assembleRelease`.
 Nur die plattformunabhängige Logik testen: `./gradlew :core:test`.
+
+## Versionen und Releases
+
+macOS-App und Android-App haben **eine gemeinsame Versionsnummer** nach
+[Semantic Versioning](https://semver.org/lang/de/) (`MAJOR.MINOR.PATCH`). Sie steht in der Datei
+[`VERSION`](VERSION); was sich geändert hat, steht in [`CHANGELOG.md`](CHANGELOG.md).
+
+- **macOS:** Versionsnummer in der Oberfläche (unter dem Titel) und im App-Bundle (Finder → Informationen).
+- **Android:** `versionName` = Version, `versionCode` = MAJOR·1 000 000 + MINOR·1 000 + PATCH, sichtbar unter
+  **Einstellungen**. Neue Versionen installieren sich über die alte.
+- **Entwicklungs-Builds** bei jedem Push bekommen einen Zusatz (z. B. `0.2.0-dev.42`) und liegen nur als
+  Artefakt am jeweiligen Lauf unter **Actions**, nicht unter Releases.
+
+### Releases erstellen
+
+1. Änderungen laufend in `CHANGELOG.md` unter **Unveröffentlicht** eintragen.
+2. Auf GitHub: **Actions → Release → Run workflow**, Branch wählen, neue Version eintragen (z. B. `0.3.0`).
+   Der Workflow setzt `VERSION`, macht aus „Unveröffentlicht“ den Abschnitt `0.3.0`, committet das auf den
+   Branch, setzt den Tag `v0.3.0`, baut und testet DMG und APK (inkl. Emulator-Test) und legt das
+   GitHub-Release mit Notizen aus dem CHANGELOG, beiden Dateien und `SHA256SUMS.txt` an.
+3. Alternativ lokal: `python tools/release.py bump 0.3.0`, committen, `git tag v0.3.0 && git push origin v0.3.0`.
+   Passt der Tag nicht zu `VERSION`, bricht der Release ab.
+
+Versionen mit Zusatz (`0.3.0-beta.1`) werden als Vorabversion veröffentlicht.
 
 ## Wie es aufgebaut ist
 

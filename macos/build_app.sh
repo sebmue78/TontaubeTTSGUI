@@ -14,7 +14,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="Tontaube TTS"
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"
-VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$ROOT/tontaube_gui/__init__.py")"
+# Versionsnummer aus der Datei VERSION (gemeinsam mit der Android-App). BUILD_SUFFIX (z. B. "-dev.42")
+# kennzeichnet Entwicklungs-Builds; Info.plist bekommt nur die reine Nummer.
+VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+FULL_VERSION="$VERSION${BUILD_SUFFIX:-}"
 
 MAKE_DMG=0; INSTALL=0
 for arg in "$@"; do
@@ -29,12 +32,13 @@ if [ "$(uname -s)" != "Darwin" ]; then echo "Dieses Skript läuft nur unter macO
 UV_BIN="${UV_BIN:-$(command -v uv || true)}"
 if [ -z "$UV_BIN" ]; then echo "uv nicht gefunden. Bitte zuerst 'brew install uv' ausführen." >&2; exit 1; fi
 
-echo "==> Baue $APP (Version $VERSION)"
+echo "==> Baue $APP (Version $FULL_VERSION)"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin" "$APP/Contents/Resources/app"
 
 # App-Code
 rsync -a --exclude '__pycache__' "$ROOT/tontaube_gui" "$APP/Contents/Resources/app/"
+echo "$FULL_VERSION" > "$APP/Contents/Resources/app/tontaube_gui/VERSION"
 cp "$ROOT/requirements.txt" "$APP/Contents/Resources/app/requirements.txt"
 cp "$UV_BIN" "$APP/Contents/Resources/bin/uv"
 chmod +x "$APP/Contents/Resources/bin/uv"
@@ -59,8 +63,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>$APP_NAME</string>
   <key>CFBundleDisplayName</key><string>$APP_NAME</string>
   <key>CFBundleIdentifier</key><string>io.github.sebmue78.tontaube-tts</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>${VERSION%%-*}</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION%%-*}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>TontaubeTTS</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
