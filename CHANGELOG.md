@@ -7,6 +7,13 @@ daraus der Abschnitt der neuen Version (siehe [Releases erstellen](README.md#rel
 
 ## [Unveröffentlicht]
 
+### macOS-App (Apple Silicon)
+- Weitere Modelle neben Tontaube (einschaltbar unter „Weitere Modelle“): **Chatterbox Multilingual** (Deutsch, Emotions-Regler), **Chatterbox Turbo** (nur Englisch, Tags wie `[laugh]` oder `[sigh]`) und **Qwen3-TTS** (Deutsch, fertige Sprecher mit Stil-Anweisung, Stimme per Beschreibung). Sie laufen über MLX auf der Apple-GPU in einer eigenen Umgebung; ein Modell-Gateway stellt sie unter derselben Adresse und mit demselben API-Key bereit.
+- Oberfläche: Modellauswahl, Tag-Knöpfe für Chatterbox Turbo, Qwen3-Sprecher und Stil-Anweisung.
+
+### Android-App „Tontaube Vorlesen“
+- Modell pro Projekt wählbar, wenn der Server weitere Modelle anbietet. Chatterbox-Tags im Dokumenttext werden bei Chatterbox Turbo mitgelesen und bei anderen Modellen weggelassen.
+
 ## [0.2.0] – 2026-11-16
 
 Erste versionierte Veröffentlichung.
