@@ -7,12 +7,22 @@ on:
   pull_request:
     paths: ["android/**", ".github/workflows/android-app.yml"]
   workflow_dispatch:
+  workflow_call:  # von release.yml für versionierte Releases
+    inputs:
+      ref:
+        description: Commit, der gebaut wird (leer = auslösender Commit)
+        type: string
+        default: ""
+      release:
+        description: Release-Build ohne Entwicklungs-Zusatz an der Versionsnummer
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: android-app-${{ github.ref }}
+  group: android-app-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,6 +34,14 @@ jobs:
         working-directory: android
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Version bestimmen
+        working-directory: .
+        run: |
+          # Entwicklungs-Builds bekommen einen Zusatz, z. B. 0.2.0-dev.42
+          if [ "${{ inputs.release }}" != "true" ]; then echo "BUILD_SUFFIX=-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"; fi
 
       - uses: actions/setup-java@v4
         with:
@@ -42,26 +60,18 @@ jobs:
         run: cp app/build/outputs/apk/release/app-release.apk Tontaube-Vorlesen.apk
 
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: Tontaube-Vorlesen-apk
+          path: android/Tontaube-Vorlesen.apk
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-berichte
           path: |
-            android/Tontaube-Vorlesen.apk
             android/app/build/reports/
             android/core/build/reports/
           if-no-files-found: ignore
-
-      - name: Als Release "android-latest" veröffentlichen
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG=android-latest
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" Tontaube-Vorlesen.apk \
-            --target "$GITHUB_SHA" --prerelease \
-            --title "Tontaube Vorlesen für Android – aktueller Stand" \
-            --notes "Automatisch gebaut aus ${GITHUB_REF_NAME} (${GITHUB_SHA::7}). APK auf dem Handy öffnen und installieren (einmalig „Installation aus unbekannten Quellen“ erlauben). Ab Android 8."
 
   e2e:
     # Ende-zu-Ende-Test im Emulator gegen den Mock-Server: importieren, streamen, pausieren, fortsetzen
@@ -69,6 +79,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: KVM aktivieren
         run: |

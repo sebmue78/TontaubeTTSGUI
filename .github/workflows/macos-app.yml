@@ -7,12 +7,22 @@ on:
   pull_request:
     paths-ignore: ["**.md", "docs/**", "android/**"]
   workflow_dispatch:
+  workflow_call:  # von release.yml für versionierte Releases
+    inputs:
+      ref:
+        description: Commit, der gebaut wird (leer = auslösender Commit)
+        type: string
+        default: ""
+      release:
+        description: Release-Build ohne Entwicklungs-Zusatz an der Versionsnummer
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: macos-app-${{ github.ref }}
+  group: macos-app-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -21,6 +31,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Version bestimmen
+        run: |
+          # Entwicklungs-Builds bekommen einen Zusatz, z. B. 0.2.0-dev.42
+          if [ "${{ inputs.release }}" != "true" ]; then echo "BUILD_SUFFIX=-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"; fi
+          echo "Version: $(cat VERSION)$( [ "${{ inputs.release }}" = "true" ] || echo "-dev.${GITHUB_RUN_NUMBER}")"
 
       - uses: astral-sh/setup-uv@v6
 
@@ -52,20 +70,3 @@ jobs:
         with:
           name: Tontaube-TTS-dmg
           path: dist/Tontaube-TTS.dmg
-
-      - name: Als Release veröffentlichen (main/macos-app → "macos-latest", sonst "macos-vorschau")
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG=macos-latest
-          TITLE="Tontaube TTS für macOS (Apple Silicon) – aktueller Stand"
-          case "$GITHUB_REF_NAME" in
-            main|macos-app) ;;
-            *) TAG=macos-vorschau; TITLE="Tontaube TTS für macOS (Apple Silicon) – Vorschau aus $GITHUB_REF_NAME" ;;
-          esac
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" dist/Tontaube-TTS.dmg \
-            --target "$GITHUB_SHA" --prerelease \
-            --title "$TITLE" \
-            --notes "Automatisch gebaut aus ${GITHUB_REF_NAME} (${GITHUB_SHA::7}). DMG öffnen, App in den Programme-Ordner ziehen, beim ersten Öffnen Rechtsklick → Öffnen."
