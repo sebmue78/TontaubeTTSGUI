@@ -164,6 +164,21 @@ def model_choices_update(url: str, api_key: str, current: str | None):
     return _model_update(models, current)
 
 
+def models_apply_message(manager, enabled: bool, engines: list[str], size: str | None) -> tuple[str, bool]:
+    """Speichert die Zusatzmodell-Auswahl. Gibt (Meldung für die Oberfläche, Neustart nötig?) zurück."""
+    restart = manager.set_models(enabled, engines, size)
+    if restart:
+        if manager.models.active:
+            return "Server startet mit den Zusatzmodellen neu. Danach werden sie heruntergeladen (siehe Status).", True
+        return "Server startet ohne Zusatzmodelle neu.", True
+    if not enabled:
+        return ("Nichts geändert: Bitte zuerst „Weitere Modelle anbieten“ ankreuzen und dann "
+                "„Übernehmen“ klicken."), False
+    if not engines:
+        return "Nichts geändert: Bitte mindestens ein Modell ankreuzen.", False
+    return "Keine Änderung: Die gewählten Zusatzmodelle laufen bereits (Fortschritt im Status).", False
+
+
 def check_server(url: str, api_key: str, timeout: float):
     client = _client(url, api_key, timeout)
     ok, msg = client.ready()
@@ -985,9 +1000,12 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             lan_enabled.input(on_lan_toggle, lan_enabled, [lan_info, connected_state])
 
             def on_models_apply(enabled, engines, size):
-                if manager.set_models(bool(enabled), list(engines or []), size):
+                msg, restart = models_apply_message(manager, bool(enabled), list(engines or []), size)
+                if restart:
+                    gr.Info(msg)
                     _restart_for_network()
                     return False
+                gr.Warning(msg)
                 return gr.skip()
 
             models_apply.click(on_models_apply, [models_enabled, models_engines, models_qwen_size], connected_state)
