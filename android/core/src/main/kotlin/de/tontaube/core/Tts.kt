@@ -1,5 +1,6 @@
 package de.tontaube.core
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -82,7 +83,21 @@ data class TtsSettings(
     val promptMaxTokens: Int? = null,
     /** Nur Wiedergabe (auf dem Handy), beeinflusst die erzeugte Audiodatei nicht. */
     val playbackSpeed: Float = 1.0f,
+    /** Modell hinter dem Modell-Gateway (`chatterbox`, `chatterbox-turbo`, `qwen3`); `null` = Tontaube. */
+    val model: String? = null,
+    /** Chatterbox: Emotion (0,25–2, neutral 0,5). */
+    val exaggeration: Float? = null,
+    /** Chatterbox: Führung/CFG (0–1). */
+    val cfgWeight: Float? = null,
+    /** Qwen3-TTS: fertiger Sprecher, z. B. `Ryan`. */
+    val speaker: String? = null,
+    /** Qwen3-TTS: Stil-Anweisung bzw. Stimmbeschreibung in Worten. */
+    val instruct: String? = null,
 ) {
+    /** Gewähltes Modell, `tontaube` wenn keins gesetzt ist. */
+    val modelId: String get() = model ?: Models.TONTAUBE
+    val isTontaube: Boolean get() = modelId == Models.TONTAUBE
+
     /** Kennung aller Einstellungen, die das erzeugte Audio verändern (für den Zwischenspeicher). */
     fun audioKey(voiceFingerprint: String = ""): String {
         val relevant = copy(playbackSpeed = 1.0f, streamingInitialSeconds = 0f)
@@ -112,6 +127,7 @@ object TtsRequest {
         format: String = "mp3",
         streaming: Boolean = true,
     ): String {
+        if (!settings.isTontaube) return buildGateway(text, settings, voiceAudioB64, format)
         val body = buildJsonObject {
             put("text", text)
             put("language", settings.language)
@@ -143,7 +159,106 @@ object TtsRequest {
         return body.toString()
     }
 
+    /** Body für Chatterbox/Qwen3 über das Modell-Gateway (nur Felder, die diese Modelle kennen). */
+    private fun buildGateway(text: String, settings: TtsSettings, voiceAudioB64: String?, format: String): String {
+        val model = settings.modelId
+        val body = buildJsonObject {
+            put("model", model)
+            put("text", if (model == Models.CHATTERBOX_TURBO) text else Tags.strip(text))
+            put("language", if (model == Models.CHATTERBOX_TURBO) "english" else settings.language)
+            put("format", format)
+            settings.temperature?.let { put("temperature", it.round2()) }
+            settings.seed?.let { put("seed", it) }
+            settings.bitrate?.let { put("bitrate", it) }
+            if (model.startsWith("chatterbox")) {
+                settings.exaggeration?.let { put("exaggeration", it.round2()) }
+                settings.cfgWeight?.let { put("cfg_weight", it.round2()) }
+            }
+            if (model == Models.QWEN3) {
+                settings.speaker?.takeIf { it.isNotBlank() }?.let { put("speaker", it) }
+                settings.instruct?.trim()?.takeIf { it.isNotEmpty() }?.let { put("instruct", it) }
+            }
+            when {
+                voiceAudioB64 != null -> put("voice_audio_b64", voiceAudioB64)
+                VoiceRef.serverPath(settings.voice) != null -> put("voice_path", VoiceRef.serverPath(settings.voice))
+            }
+        }
+        return body.toString()
+    }
+
     private fun Float.round2(): Double = Math.round(this * 100.0) / 100.0
+}
+
+/** Bekannte Modelle. Was ein Server wirklich anbietet, steht in `GET /models` (siehe [ModelSpec]). */
+object Models {
+    const val TONTAUBE = "tontaube"
+    const val CHATTERBOX = "chatterbox"
+    const val CHATTERBOX_TURBO = "chatterbox-turbo"
+    const val QWEN3 = "qwen3"
+}
+
+/** Paralinguistische Tags von Chatterbox Turbo, z. B. `[laugh]`. */
+object Tags {
+    val turbo: List<String> = listOf(
+        "[laugh]", "[chuckle]", "[sigh]", "[gasp]", "[cough]", "[clear throat]", "[sniff]", "[groan]", "[shush]",
+    )
+    private val regex = Regex(
+        "\\[(?:" + turbo.joinToString("|") { Regex.escape(it.removeSurrounding("[", "]")) } + ")\\]",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /** Entfernt die Tags, damit Modelle ohne Tag-Unterstützung sie nicht vorlesen. */
+    fun strip(text: String): String = regex.replace(text, "").replace(Regex("[ \\t]{2,}"), " ").trim()
+
+    fun contains(text: String): Boolean = regex.containsMatchIn(text)
+}
+
+/** Ein Regler eines Gateway-Modells (aus `GET /models`). */
+@Serializable
+data class ModelParam(
+    val name: String,
+    val label: String,
+    val min: Float,
+    val max: Float,
+    val step: Float = 0.05f,
+    val default: Float,
+    val description: String = "",
+)
+
+/** Ein Sprecher von Qwen3-TTS. */
+@Serializable
+data class ModelSpeaker(val id: String, val label: String = id)
+
+/** Ein Modell, das der Server anbietet (`GET /models`, nur mit Modell-Gateway). */
+@Serializable
+data class ModelSpec(
+    val id: String,
+    val name: String,
+    val description: String = "",
+    val languages: List<String> = emptyList(),
+    @SerialName("voice_cloning") val voiceCloning: Boolean = true,
+    val speakers: List<ModelSpeaker> = emptyList(),
+    val instruct: Boolean = false,
+    val tags: List<String> = emptyList(),
+    val params: List<ModelParam> = emptyList(),
+    val controls: Boolean = false,
+    val license: String = "",
+) {
+    val isTontaube: Boolean get() = id == Models.TONTAUBE
+
+    companion object {
+        val tontaube = ModelSpec(
+            Models.TONTAUBE, "Tontaube V1.1", controls = true,
+            languages = Languages.all.map { it.second },
+        )
+
+        /** Liest `GET /models`. Unbekannte Felder werden ignoriert, kaputte Einträge übersprungen. */
+        fun parse(json: String): List<ModelSpec> {
+            val root = runCatching { TontaubeJson.parseToJsonElement(json) }.getOrNull() ?: return emptyList()
+            val list = ((root as? JsonObject)?.get("models") ?: root) as? JsonArray ?: return emptyList()
+            return list.mapNotNull { el -> runCatching { TontaubeJson.decodeFromJsonElement(serializer(), el) }.getOrNull() }
+        }
+    }
 }
 
 /** Ein Stil-Regler des Modells (aus `GET /controls`). Stufen 0 … bins-1. */

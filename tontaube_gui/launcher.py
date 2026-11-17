@@ -16,6 +16,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import io
+import json
 import os
 import platform
 import shutil
@@ -39,6 +40,15 @@ SERVER_TARBALL = f"https://codeload.github.com/craitech/tontaube/tar.gz/refs/tag
 ASSETS = Path(__file__).resolve().parent / "server_assets"
 PATCH_FILE = ASSETS / "tontaube-v1.1.0-apple-silicon.patch"
 REQUIREMENTS_FILE = ASSETS / "requirements-server-macos.txt"
+ENGINES_REQUIREMENTS_FILE = ASSETS / "requirements-engines-macos.txt"
+GATEWAY_SCRIPT = ASSETS / "model_gateway.py"
+
+# Zusatzmodelle hinter dem Gateway (Kennung → Anzeigename).
+EXTRA_MODELS = {
+    "chatterbox": "Chatterbox Multilingual (Deutsch, Emotions-Regler)",
+    "chatterbox-turbo": "Chatterbox Turbo (nur Englisch, Tags wie [laugh])",
+    "qwen3": "Qwen3-TTS (Deutsch, Stil-Anweisungen, Stimme per Beschreibung)",
+}
 
 # Ungefähre Downloadgröße beim ersten Start (int4-Modell, DualCodec, W2V-BERT, VibeVoice).
 EXPECTED_DOWNLOAD_GB = 8.0
@@ -93,6 +103,41 @@ def _which(name: str) -> str | None:
     return shutil.which(name, path=path)
 
 
+class GatewayError(RuntimeError):
+    """Das Modell-Gateway ist abgestürzt (Tontaube selbst läuft womöglich)."""
+
+
+@dataclass
+class ModelSettings:
+    """Zusatzmodelle (Chatterbox, Qwen3-TTS) über das Modell-Gateway."""
+
+    enabled: bool = False
+    engines: list[str] = field(default_factory=lambda: list(EXTRA_MODELS))
+    qwen_size: str = "1.7B"
+    path: Path | None = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def load(cls, path: Path) -> "ModelSettings":
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        engines = [e for e in data.get("engines", list(EXTRA_MODELS)) if e in EXTRA_MODELS]
+        size = data.get("qwen_size") if data.get("qwen_size") in ("0.6B", "1.7B") else "1.7B"
+        return cls(enabled=bool(data.get("enabled", False)), engines=engines, qwen_size=size, path=Path(path))
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and bool(self.engines)
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"enabled": self.enabled, "engines": self.engines, "qwen_size": self.qwen_size}
+        self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 @dataclass
 class ServerState:
     phase: str = "idle"  # idle, setup, starting, ready, error, stopped
@@ -125,8 +170,10 @@ class ServerManager:
         self.home = (home or default_home()).resolve()
         self.src = self.home / f"server-{SERVER_VERSION}"
         self.venv = self.home / "server-venv"
+        self.engines_venv = self.home / "engines-venv"
         self.logs = self.home / "logs"
         self.log_file = self.logs / "server.log"
+        self.gateway_log = self.logs / "gateway.log"
         self.preferred_port = port
         self.device = device or os.environ.get("LITE_DEVICE") or default_device()
         self._dtype_auto = not (dtype or os.environ.get("LITE_CPU_DTYPE"))
@@ -134,6 +181,10 @@ class ServerManager:
         self._fell_back = False
         self.state = ServerState()
         self.proc: subprocess.Popen | None = None
+        self.gateway_proc: subprocess.Popen | None = None
+        self.models = ModelSettings.load(self.home / "models.json")
+        self._gateway_active = False  # läuft das Gateway gerade (nicht die gespeicherte Einstellung)?
+        self._gateway_error = ""
         self._lines: deque[str] = deque(maxlen=400)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -169,16 +220,21 @@ class ServerManager:
 
     def log_tail(self, n: int = 40) -> str:
         lines = list(self._lines)
-        if self.log_file.exists():
+        files = [("Server-Log", self.log_file)]
+        if self._gateway_active:
+            files.append(("Gateway-Log (Chatterbox/Qwen3)", self.gateway_log))
+        for title, path in files:
+            if not path.exists():
+                continue
             try:
-                with open(self.log_file, "rb") as fh:
+                with open(path, "rb") as fh:
                     fh.seek(0, os.SEEK_END)
                     size = fh.tell()
                     fh.seek(max(0, size - 20000))
-                    lines += ["— Server-Log —"] + fh.read().decode("utf-8", "replace").splitlines()[-n:]
+                    lines += [f"— {title} —"] + fh.read().decode("utf-8", "replace").splitlines()[-n:]
             except OSError:
                 pass
-        return "\n".join(lines[-n:])
+        return "\n".join(lines[-2 * n:])
 
     def downloaded_gb(self) -> float:
         return max(0, _dir_size(self._hf_cache) - self._cache_baseline) / 1e9
@@ -204,6 +260,11 @@ class ServerManager:
                 f"Server: `{s.url}` · Rechenwerk: {self.DEVICE_LABELS.get(self.device, self.device)} · "
                 f"Genauigkeit: `{self.dtype}`{lan}"
             )
+            if self._gateway_active:
+                names = ", ".join(EXTRA_MODELS[e].split(" (")[0] for e in self.models.engines)
+                lines.append(f"Zusatzmodelle: {names} (werden beim ersten Gebrauch geladen)")
+        if self._gateway_error:
+            lines.append(f"⚠️ Zusatzmodelle nicht verfügbar: {self._gateway_error}")
         return "\n\n".join(lines)
 
     # -- Netzwerk-Freigabe ----------------------------------------------
@@ -237,6 +298,22 @@ class ServerManager:
         self.network.save()
         return changed or (enabled != self._lan_active)
 
+    def set_models(self, enabled: bool, engines: list[str] | None = None, qwen_size: str | None = None) -> bool:
+        """Speichert die Zusatzmodell-Einstellung. True, wenn der Server dafür neu starten muss."""
+        before = (self.models.active, tuple(self.models.engines), self.models.qwen_size)
+        self.models.enabled = enabled
+        if engines is not None:
+            self.models.engines = [e for e in engines if e in EXTRA_MODELS]
+        if qwen_size in ("0.6B", "1.7B"):
+            self.models.qwen_size = qwen_size
+        self.models.save()
+        after = (self.models.active, tuple(self.models.engines), self.models.qwen_size)
+        return before != after or self.models.active != self._gateway_active
+
+    @property
+    def gateway_active(self) -> bool:
+        return self._gateway_active
+
     @property
     def url(self) -> str:
         return self.state.url
@@ -266,15 +343,14 @@ class ServerManager:
 
     def reinstall(self) -> None:
         self.stop()
-        for marker in (self.src / ".tontaube-patched", self.venv / ".tontaube-installed"):
+        for marker in (self.src / ".tontaube-patched", self.venv / ".tontaube-installed",
+                       self.engines_venv / ".tontaube-installed"):
             marker.unlink(missing_ok=True)
         self.start()
 
-    def stop(self) -> None:
-        self._stop.set()
-        proc = self.proc
+    def _kill(self, proc: subprocess.Popen | None, what: str) -> None:
         if proc and proc.poll() is None:
-            self._log("Server wird beendet …")
+            self._log(f"{what} wird beendet …")
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError, AttributeError):
@@ -286,7 +362,16 @@ class ServerManager:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, AttributeError):
                     proc.kill()
+
+    def _kill_all(self) -> None:
+        self._kill(self.gateway_proc, "Modell-Gateway")
+        self._kill(self.proc, "Server")
+        self.gateway_proc = None
         self.proc = None
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._kill_all()
         if self.state.phase in ("ready", "starting", "setup"):
             self._set("stopped", "Server gestoppt.", "", None)
 
@@ -296,11 +381,21 @@ class ServerManager:
             self._ensure_source()
             self._ensure_venv()
             tools_path = self._ensure_system_tools()
+            gateway = self._ensure_engines()
             if self._stop.is_set():
                 return
-            self._start_server(tools_path)
+            self._start_server(tools_path, gateway)
             try:
-                self._wait_ready()
+                try:
+                    self._wait_ready()
+                except GatewayError as exc:
+                    # Ohne Zusatzmodelle weitermachen, damit Tontaube nutzbar bleibt.
+                    self._log(str(exc))
+                    self._kill_all()
+                    gateway = False
+                    self._start_server(tools_path, gateway)
+                    self._gateway_error = "Das Gateway ist beim Start abgestürzt (siehe Gateway-Log). Tontaube läuft ohne Zusatzmodelle."
+                    self._wait_ready()
             except RuntimeError:
                 if self.device != "mps" or self._stop.is_set():
                     raise
@@ -309,7 +404,8 @@ class ServerManager:
                 self.device, self._fell_back = "cpu", True
                 if self._dtype_auto:
                     self.dtype = default_dtype("cpu")
-                self._start_server(tools_path)
+                self._kill_all()
+                self._start_server(tools_path, gateway)
                 self._wait_ready()
         except Exception as exc:  # noqa: BLE001 - alles soll in der GUI landen
             self._set("error", "Einrichtung oder Start fehlgeschlagen.", f"`{type(exc).__name__}: {exc}`", None)
@@ -364,6 +460,32 @@ class ServerManager:
         self._set("setup", "Installiere den Tontaube-Server …")
         self._stream_cmd([uv, "pip", "install", "--python", str(py), "--no-deps", "-e", str(self.src)])
         marker.write_text(want)
+
+    def _ensure_engines(self) -> bool:
+        """Umgebung für Chatterbox/Qwen3 (mlx-audio). False, wenn aus oder nicht installierbar."""
+        self._gateway_error = ""
+        if not self.models.active:
+            return False
+        if platform.system() == "Darwin" and platform.machine() != "arm64":
+            self._gateway_error = "Chatterbox und Qwen3-TTS laufen hier nur auf Apple Silicon (MLX)."
+            return False
+        marker = self.engines_venv / ".tontaube-installed"
+        want = hashlib.sha256(ENGINES_REQUIREMENTS_FILE.read_bytes()).hexdigest()
+        if marker.exists() and marker.read_text().strip() == want:
+            return True
+        try:
+            uv = self._uv()
+            py = self.engines_venv / "bin" / "python"
+            self._set("setup", "Lege die Umgebung für Chatterbox und Qwen3-TTS an …")
+            self._stream_cmd([uv, "venv", "--allow-existing", "--python", "3.12", str(self.engines_venv)])
+            self._set("setup", "Installiere mlx-audio für Chatterbox und Qwen3-TTS (einige Minuten) …")
+            self._stream_cmd([uv, "pip", "install", "--python", str(py), "-r", str(ENGINES_REQUIREMENTS_FILE)])
+            marker.write_text(want)
+            return True
+        except Exception as exc:  # noqa: BLE001 - Tontaube soll trotzdem starten
+            self._gateway_error = f"Installation fehlgeschlagen ({exc}). Tontaube läuft trotzdem."
+            self._log(self._gateway_error)
+            return False
 
     def _ensure_system_tools(self) -> list[str]:
         """ffmpeg/ffprobe (Audio-Konvertierung) und libopus (Opus-Streaming)."""
@@ -421,11 +543,56 @@ class ServerManager:
             env.pop("TTS_API_KEY", None)
         return env
 
-    def _start_server(self, tools_path: list[str]) -> None:
+    def _gateway_env(self, tools_path: list[str], port: int, upstream_port: int, lan: bool) -> dict[str, str]:
+        env = dict(os.environ)
+        env.update(
+            {
+                "GATEWAY_HOST": "0.0.0.0" if lan else "127.0.0.1",
+                "GATEWAY_PORT": str(port),
+                "GATEWAY_UPSTREAM": f"http://127.0.0.1:{upstream_port}",
+                "GATEWAY_VOICES_DIR": str(self.src / "voices"),
+                "GATEWAY_ENGINES": ",".join(self.models.engines),
+                "GATEWAY_QWEN_SIZE": self.models.qwen_size,
+                "PATH": os.pathsep.join([str(self.engines_venv / "bin"), *tools_path, env.get("PATH", "")]),
+                "PYTHONUNBUFFERED": "1",
+                "TOKENIZERS_PARALLELISM": "false",
+            }
+        )
+        env.pop("PYTHONPATH", None)
+        if lan:
+            env.update({"REQUIRE_API_KEY": "1", "TTS_API_KEY": self.network.api_key})
+        else:
+            env.pop("REQUIRE_API_KEY", None)
+            env.pop("TTS_API_KEY", None)
+        return env
+
+    def _start_gateway(self, tools_path: list[str], port: int, upstream_port: int, lan: bool) -> None:
+        if self.gateway_log.exists():
+            self.gateway_log.replace(self.logs / "gateway.previous.log")
+        log = open(self.gateway_log, "wb")  # noqa: SIM115 - bleibt für die Laufzeit offen
+        self.gateway_proc = subprocess.Popen(
+            [str(self.engines_venv / "bin" / "python"), "-I", str(GATEWAY_SCRIPT)],
+            cwd=self.home,
+            env=self._gateway_env(tools_path, port, upstream_port, lan),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    def _start_server(self, tools_path: list[str], gateway: bool = False) -> None:
         lan = self.network.enabled and bool(self.network.api_key)
         port = _free_port(self.network.port if lan else self.preferred_port, "0.0.0.0" if lan else "127.0.0.1")
         self._lan_active = lan
+        self._gateway_active = gateway
         self.state.url = f"http://127.0.0.1:{port}"
+        public_port = port
+        if gateway:
+            # Tontaube nur lokal und ohne Key; das Gateway übernimmt Adresse, Port und API-Key.
+            port = next(p for p in range(public_port + 100, public_port + 200)
+                        if p != public_port and _free_port(p) == p)
+            lan_tontaube = False
+        else:
+            lan_tontaube = lan
         self._cache_baseline = _dir_size(self._hf_cache)
         self.logs.mkdir(parents=True, exist_ok=True)
         if self.log_file.exists():
@@ -436,11 +603,13 @@ class ServerManager:
         self.proc = subprocess.Popen(
             [str(exe), "serve"],
             cwd=self.src,
-            env=self._server_env(tools_path, port, lan),
+            env=self._server_env(tools_path, port, lan_tontaube),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        if gateway:
+            self._start_gateway(tools_path, public_port, port, lan)
 
     def _wait_ready(self) -> None:
         while not self._stop.is_set():
@@ -450,6 +619,12 @@ class ServerManager:
             code = proc.poll()
             if code is not None:
                 raise RuntimeError(f"Server wurde beendet (Code {code}). Details im Server-Log unten.")
+            gw = self.gateway_proc
+            if gw is not None and gw.poll() is not None:
+                raise GatewayError(
+                    f"Das Modell-Gateway (Chatterbox/Qwen3) wurde beendet (Code {gw.returncode}). "
+                    "Details im Gateway-Log unten; zum Umgehen die Zusatzmodelle ausschalten."
+                )
             try:
                 r = requests.get(self.state.url + "/readyz", timeout=3)
                 if r.ok:

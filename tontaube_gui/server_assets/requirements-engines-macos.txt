@@ -1,0 +1,8 @@
+# Zusatzmodelle (Chatterbox, Qwen3-TTS) über MLX auf der Apple-GPU, plus das Modell-Gateway.
+# Eigene Umgebung, damit sich mlx-audio (transformers 5) und Tontaube (transformers 4) nicht stören.
+mlx-audio==0.6.4
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+httpx>=0.27,<1
+lameenc==1.8.2
+numpy>=1.26,<3

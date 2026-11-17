@@ -138,6 +138,52 @@ class TtsTest {
     }
 
     @Test
+    fun newModelFieldsKeepOldAudioKeys() {
+        // Projekte von vor der Modellauswahl dürfen ihren Audio-Zwischenspeicher nicht verlieren.
+        val a = TtsSettings()
+        assertEquals(false, a.encode().contains("model"))
+        assertNotEquals(a.audioKey(), a.copy(model = Models.QWEN3).audioKey())
+        assertEquals(a, TtsSettings.decode("""{"language":"german","tag":"audiobook"}"""))
+    }
+
+    @Test
+    fun gatewayRequestForQwenAndChatterbox() {
+        val q = TtsSettings(model = Models.QWEN3, speaker = "Ryan", instruct = " ruhig ", temperature = 0.8f,
+            controls = mapOf("rate" to 3), voice = VoiceRef.server("samples/Juri.mp3"))
+        val body = TontaubeJson.parseToJsonElement(TtsRequest.build("Hallo [laugh] Welt.", q)).jsonObject
+        assertEquals("qwen3", body["model"]!!.jsonPrimitive.content)
+        assertEquals("Hallo Welt.", body["text"]!!.jsonPrimitive.content)
+        assertEquals("ruhig", body["instruct"]!!.jsonPrimitive.content)
+        assertEquals("samples/Juri.mp3", body["voice_path"]!!.jsonPrimitive.content)
+        assertNull(body["controls"]); assertNull(body["tag"]); assertNull(body["exaggeration"])
+
+        val t = TtsSettings(model = Models.CHATTERBOX_TURBO, exaggeration = 0.7f, speaker = "Ryan")
+        val tb = TontaubeJson.parseToJsonElement(TtsRequest.build("Oh [laugh] no.", t, "QUJD")).jsonObject
+        assertEquals("Oh [laugh] no.", tb["text"]!!.jsonPrimitive.content)
+        assertEquals("english", tb["language"]!!.jsonPrimitive.content)
+        assertEquals("QUJD", tb["voice_audio_b64"]!!.jsonPrimitive.content)
+        assertNull(tb["speaker"])
+
+        val plain = TontaubeJson.parseToJsonElement(TtsRequest.build("Hallo", TtsSettings())).jsonObject
+        assertNull(plain["model"])
+    }
+
+    @Test
+    fun modelsFromServer() {
+        val json = """{"models":[{"id":"tontaube","name":"Tontaube V1.1","controls":true},
+            {"id":"qwen3","name":"Qwen3-TTS","languages":["german","english"],"instruct":true,
+             "speakers":[{"id":"Ryan","label":"Ryan (m)"}],"params":[{"name":"temperature","label":"Temperatur",
+             "min":0.05,"max":2.0,"step":0.05,"default":0.9,"description":"x"}],"loaded":false,"extra":1},
+            {"name":"kaputt"}],"gateway":1}"""
+        val models = ModelSpec.parse(json)
+        assertEquals(listOf("tontaube", "qwen3"), models.map { it.id })
+        assertEquals("Ryan", models[1].speakers.single().id)
+        assertEquals(0.9f, models[1].params.single().default)
+        assertTrue(ModelSpec.parse("not json").isEmpty())
+        assertEquals("a b", Tags.strip("a [Sigh]  b"))
+    }
+
+    @Test
     fun controlsFromServer() {
         val json = """{"controls":[{"name":"rate","bins":5,"description":"speaking rate","low":"slow","high":"fast"},
             {"name":"legato","bins":3,"default":2},{"name":"breath","bins":4,"description":"Atmen","low":"keins","high":"hörbar"}]}"""
