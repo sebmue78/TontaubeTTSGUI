@@ -7,6 +7,8 @@ daraus der Abschnitt der neuen Version (siehe [Releases erstellen](README.md#rel
 
 ## [Unveröffentlicht]
 
+## [0.3.2] – 2026-11-17
+
 ### macOS-App (Apple Silicon)
 - „Übernehmen“ unter „Weitere Modelle“ meldet jetzt immer, was passiert. Vorher blieb der Klick stumm, wenn „Weitere Modelle anbieten“ nicht angekreuzt war; jetzt erscheint ein Hinweis, das Häkchen zu setzen. Beim Neustart erscheint „Server startet mit den Zusatzmodellen neu“.
 
