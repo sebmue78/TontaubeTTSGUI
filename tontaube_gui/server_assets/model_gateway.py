@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import fnmatch
 import gc
 import hashlib
 import io
@@ -159,6 +160,7 @@ class Settings:
     max_loaded: int = 2
     fake: bool = False
     qwen_size: str = "1.7B"
+    prefetch: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -177,6 +179,7 @@ class Settings:
             max_loaded=max(1, int(os.environ.get("GATEWAY_MAX_LOADED", "2"))),
             fake=os.environ.get("GATEWAY_FAKE_ENGINES", "0") == "1",
             qwen_size=os.environ.get("GATEWAY_QWEN_SIZE", "1.7B"),
+            prefetch=os.environ.get("GATEWAY_PREFETCH", "1") != "0",
         )
 
 
@@ -612,6 +615,190 @@ class Worker:
 
 
 # ---------------------------------------------------------------------------
+# Vorladen (Download der Gewichte direkt nach dem Start)
+# ---------------------------------------------------------------------------
+
+# Welche Gewichte je Modell vorab geladen werden, in dieser Reihenfolge. Qwen3 braucht je nach Anfrage
+# eine von drei Varianten: fertige Sprecher (Standard), Stimme klonen, Stimme per Beschreibung.
+PREFETCH_VARIANTS = {
+    "chatterbox": ["chatterbox"],
+    "chatterbox-turbo": ["chatterbox-turbo"],
+    "qwen3": ["qwen3-custom", "qwen3-base", "qwen3-design"],
+}
+VARIANT_LABELS = {
+    "chatterbox": "Chatterbox Multilingual",
+    "chatterbox-turbo": "Chatterbox Turbo",
+    "qwen3-custom": "Qwen3-TTS (Sprecher)",
+    "qwen3-base": "Qwen3-TTS (Stimme klonen)",
+    "qwen3-design": "Qwen3-TTS (Stimme per Beschreibung)",
+}
+# Dieselben Dateimuster wie mlx-audio beim Laden (mlx_audio.utils.DEFAULT_ALLOW_PATTERNS).
+ALLOW_PATTERNS = ["*.json", "*.safetensors", "*.py", "*.model", "*.tiktoken", "*.txt", "*.jinja", "*.jsonl",
+                  "*.yaml", "*.npz", "*.pth"]
+
+
+def _allow_patterns() -> list[str]:
+    try:
+        from mlx_audio.utils import DEFAULT_ALLOW_PATTERNS
+
+        return list(DEFAULT_ALLOW_PATTERNS)
+    except Exception:  # noqa: BLE001 - ohne mlx-audio (Tests) die Kopie nehmen
+        return ALLOW_PATTERNS
+
+
+def _hub_cache() -> Path:
+    try:
+        from huggingface_hub import constants
+
+        return Path(constants.HF_HUB_CACHE)
+    except Exception:  # noqa: BLE001
+        home = os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+        return Path(os.environ.get("HF_HUB_CACHE") or Path(home) / "hub")
+
+
+def _tree_size(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def hub_repo_size(repo: str) -> int:
+    """Gesamtgröße der Dateien, die mlx-audio von ``repo`` lädt (0, wenn unbekannt)."""
+    from huggingface_hub import HfApi
+
+    info = HfApi().model_info(repo, files_metadata=True)
+    patterns = _allow_patterns()
+    return sum(int(s.size or 0) for s in info.siblings or []
+               if any(fnmatch.fnmatch(s.rfilename, p) for p in patterns))
+
+
+def hub_download(repo: str) -> None:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(repo, allow_patterns=_allow_patterns())
+
+
+def hub_cached_bytes(repo: str) -> int:
+    return _tree_size(_hub_cache() / ("models--" + repo.replace("/", "--")))
+
+
+def _gb(n: int) -> str:
+    return f"{n / 1e9:.1f} GB"
+
+
+class Prefetcher:
+    """Lädt nach dem Start die Gewichte der eingeschalteten Modelle herunter (nur auf die Platte, nicht in den
+    Speicher). So muss die erste Anfrage, etwa aus der Android-App, nicht minutenlang auf den Download warten."""
+
+    def __init__(self, settings: Settings, download: Callable[[str], None] = hub_download,
+                 size: Callable[[str], int] = hub_repo_size, cached: Callable[[str], int] = hub_cached_bytes,
+                 poll: float = 2.0):
+        self.settings = settings
+        self._download, self._size, self._cached, self._poll = download, size, cached, poll
+        self._lock = threading.Lock()
+        self.items: list[dict[str, Any]] = []
+        for model in settings.engines:
+            for variant in PREFETCH_VARIANTS.get(model, []):
+                self.items.append({"variant": variant, "model": model, "label": VARIANT_LABELS[variant],
+                                   "repo": "", "state": "pending", "done_bytes": 0, "total_bytes": 0, "error": ""})
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.items and self.thread is None:
+            self.thread = threading.Thread(target=self.run, daemon=True, name="gateway-prefetch")
+            self.thread.start()
+
+    def _update(self, item: dict, **kw: Any) -> None:
+        with self._lock:
+            item.update(kw)
+
+    def run(self) -> None:
+        log.info("Lade die Modelle im Hintergrund herunter: %s", ", ".join(i["label"] for i in self.items))
+        for item in self.items:
+            self._fetch(item)
+        failed = [i["label"] for i in self.items if i["state"] == "error"]
+        if failed:
+            log.warning("Vorladen beendet, fehlgeschlagen: %s (wird beim ersten Gebrauch erneut versucht)",
+                        ", ".join(failed))
+        else:
+            log.info("Alle Modelle heruntergeladen.")
+
+    def _fetch(self, item: dict) -> None:
+        errors = []
+        for repo in repo_candidates(self.settings, item["variant"]):
+            self._update(item, repo=repo, state="downloading", done_bytes=0, total_bytes=0, error="")
+            try:
+                total = self._size(repo)
+            except Exception as exc:  # noqa: BLE001 - offline o. Ä.: trotzdem versuchen, ohne Prozentangabe
+                log.info("Größe von %s unbekannt: %s", repo, exc)
+                total = 0
+            have = self._cached(repo)
+            self._update(item, total_bytes=total, done_bytes=min(have, total) if total else have)
+            if total and have >= total:
+                log.info("%s ist schon heruntergeladen (%s).", repo, _gb(total))
+            else:
+                log.info("Lade %s herunter: %s (%s) …", item["label"], repo, _gb(total) if total else "Größe unbekannt")
+            stop = threading.Event()
+            watcher = threading.Thread(target=self._watch, args=(item, repo, stop), daemon=True)
+            watcher.start()
+            t0 = time.time()
+            try:
+                self._download(repo)
+            except Exception as exc:  # noqa: BLE001 - nächsten Kandidaten versuchen
+                log.warning("Download von %s fehlgeschlagen: %s", repo, exc)
+                errors.append(f"{repo}: {exc}")
+                continue
+            finally:
+                stop.set()
+                watcher.join(5)
+            size = self._cached(repo)
+            self._update(item, state="done", done_bytes=max(size, total), total_bytes=max(size, total))
+            log.info("%s heruntergeladen (%s, %.0f s).", item["label"], _gb(max(size, total)), time.time() - t0)
+            return
+        self._update(item, state="error", error=" | ".join(errors)[-500:])
+
+    def _watch(self, item: dict, repo: str, stop: threading.Event) -> None:
+        last_log = 0.0
+        while not stop.wait(self._poll):
+            done = self._cached(repo)
+            total = item["total_bytes"]
+            self._update(item, done_bytes=min(done, total) if total else done)
+            if time.time() - last_log >= 15:
+                last_log = time.time()
+                if total:
+                    log.info("Download %s: %s von %s (%d %%)", item["label"], _gb(done), _gb(total),
+                             min(100, int(100 * done / total)))
+                else:
+                    log.info("Download %s: %s", item["label"], _gb(done))
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            items = [dict(i) for i in self.items]
+        busy = any(i["state"] in ("pending", "downloading") for i in items)
+        return {"active": busy, "items": items,
+                "done_bytes": sum(i["done_bytes"] for i in items),
+                "total_bytes": sum(i["total_bytes"] for i in items)}
+
+    def model_state(self, model: str) -> dict[str, Any]:
+        """Download-Stand eines Modells (alle Varianten zusammen) für ``/models``."""
+        items = [i for i in self.status()["items"] if i["model"] == model]
+        if not items:
+            return {"downloaded": None}
+        total = sum(i["total_bytes"] for i in items)
+        done = sum(i["done_bytes"] for i in items)
+        return {
+            "downloaded": all(i["state"] == "done" for i in items),
+            "downloading": any(i["state"] == "downloading" for i in items),
+            "download_progress": round(done / total, 3) if total else None,
+        }
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
@@ -620,17 +807,20 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
 OPEN_PATHS = {"/", "/api", "/healthz", "/readyz"}
 
 
-def create_app(settings: Settings, backend: Backend | None = None):
+def create_app(settings: Settings, backend: Backend | None = None, prefetcher: Prefetcher | None = None):
     import httpx
 
     if backend is None:
         backend = FakeBackend() if settings.fake else MlxBackend(settings)
+    if prefetcher is None and settings.prefetch and not settings.fake:
+        prefetcher = Prefetcher(settings)
     worker = Worker(backend)
     app = FastAPI(title="Tontaube Modell-Gateway", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.worker = worker
     app.state.settings = settings
     client = httpx.AsyncClient(base_url=settings.upstream, timeout=httpx.Timeout(None, connect=5.0))
     app.state.client = client
+    app.state.prefetcher = prefetcher  # startet main() (Tests rufen start() selbst auf)
 
     @app.middleware("http")
     async def api_key_guard(request: Request, call_next):
@@ -662,8 +852,19 @@ def create_app(settings: Settings, backend: Backend | None = None):
             d["ready"] = True
             d["loaded"] = any(_model_of(v) == mid for v in loaded)
             d["loading"] = bool(worker.loading) and _model_of(worker.loading or "") == mid
+            if prefetcher is not None:
+                d.update(prefetcher.model_state(mid))
             out.append(d)
         return {"models": out, "gateway": 1}
+
+    @app.get("/gateway/status")
+    async def gateway_status():
+        return {
+            "engines": settings.engines,
+            "loaded": backend.loaded(),
+            "loading": worker.loading,
+            "prefetch": prefetcher.status() if prefetcher is not None else None,
+        }
 
     async def _read_json(request: Request) -> tuple[bytes, dict | None]:
         raw = await request.body()
@@ -803,7 +1004,10 @@ def main() -> None:
 
     log.info("Gateway auf %s:%s → Tontaube %s, Modelle: %s%s", settings.host, settings.port, settings.upstream,
              ", ".join(settings.engines) or "keine", " (Testmodus)" if settings.fake else "")
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_level="info")
+    app = create_app(settings)
+    if app.state.prefetcher is not None:
+        app.state.prefetcher.start()
+    uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
 
 
 if __name__ == "__main__":

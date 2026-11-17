@@ -7,6 +7,11 @@ daraus der Abschnitt der neuen Version (siehe [Releases erstellen](README.md#rel
 
 ## [Unveröffentlicht]
 
+### macOS-App (Apple Silicon)
+- Die eingeschalteten Zusatzmodelle (Chatterbox, Qwen3-TTS) werden direkt nach dem Serverstart im Hintergrund heruntergeladen, nicht erst bei der ersten Anfrage. Der Fortschritt steht im Status („Zusatzmodelle werden heruntergeladen … 1.2 von 3.8 GB“) und im Gateway-Log. So bricht auch eine erste Anfrage aus der Android-App nicht mehr am langen Download ab.
+- „Server neu starten“ übernimmt jetzt auch die Auswahl unter „Weitere Modelle“; vorher startete der Server ohne sie neu, und die Modelle fehlten in der Modellauswahl. Der Status weist darauf hin, wenn sie eingeschaltet, aber noch nicht aktiv sind.
+- Die Modellauswahl wird alle 10 Sekunden mit dem Server abgeglichen, damit Chatterbox und Qwen3 auch erscheinen, wenn das Gateway erst nach dem Verbinden antwortet.
+
 ## [0.3.0] – 2026-11-17
 
 ### macOS-App (Apple Silicon)

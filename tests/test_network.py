@@ -61,3 +61,23 @@ def test_model_settings_and_restart_flag(tmp_path):
     env = m._gateway_env([], 8080, 8180, lan=False)
     assert env["GATEWAY_UPSTREAM"] == "http://127.0.0.1:8180" and env["GATEWAY_ENGINES"] == "qwen3"
     assert "TTS_API_KEY" not in env
+
+
+def test_prefetch_status_line(tmp_path):
+    m = ServerManager(home=tmp_path)
+    m._gateway_active = True
+    m.state.phase = "ready"
+    m.models.engines = ["qwen3"]
+    m._gw_status_at = 1e12  # Zwischenspeicher gilt, kein HTTP
+    m._gw_status = {"prefetch": {"items": [
+        {"label": "Qwen3-TTS (Sprecher)", "state": "done", "done_bytes": 1e9, "total_bytes": 1e9},
+        {"label": "Qwen3-TTS (Stimme klonen)", "state": "downloading", "done_bytes": 1e9, "total_bytes": 4e9},
+        {"label": "Qwen3-TTS (Stimme per Beschreibung)", "state": "pending", "done_bytes": 0, "total_bytes": 0},
+    ]}}
+    line = m.prefetch_markdown()
+    assert "2 von 3" in line and "1.0 von 4.0 GB (25 %)" in line
+    for item in m._gw_status["prefetch"]["items"]:
+        item["state"] = "done"
+    assert m.prefetch_markdown().startswith("✅")
+    m._gw_status = None
+    assert "beim ersten Gebrauch" in m.prefetch_markdown()
