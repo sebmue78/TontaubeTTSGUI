@@ -81,3 +81,18 @@ def test_prefetch_status_line(tmp_path):
     assert m.prefetch_markdown().startswith("✅")
     m._gw_status = None
     assert "beim ersten Gebrauch" in m.prefetch_markdown()
+
+
+def test_models_apply_message(tmp_path):
+    from tontaube_gui.app import models_apply_message
+
+    m = ServerManager(home=tmp_path)
+    msg, restart = models_apply_message(m, False, ["qwen3"], "1.7B")
+    assert not restart and "ankreuzen" in msg
+    msg, restart = models_apply_message(m, True, [], "1.7B")
+    assert not restart and "mindestens ein Modell" in msg
+    msg, restart = models_apply_message(m, True, ["qwen3"], "1.7B")
+    assert restart and "neu" in msg and m.models.active
+    m._gateway_active = True
+    msg, restart = models_apply_message(m, True, ["qwen3"], "1.7B")
+    assert not restart and "laufen bereits" in msg

@@ -355,7 +355,8 @@ class ServerManager:
             self.models.qwen_size = qwen_size
         self.models.save()
         after = (self.models.active, tuple(self.models.engines), self.models.qwen_size)
-        return before != after or self.models.active != self._gateway_active
+        # Neustart nur, wenn sich am laufenden Gateway etwas ändert (bei ausgeschalteten Modellen nie).
+        return self.models.active != self._gateway_active or (self.models.active and before != after)
 
     @property
     def gateway_active(self) -> bool:
