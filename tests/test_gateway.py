@@ -180,3 +180,66 @@ def test_chatterbox_without_voice_uses_bundled_voice_of_language(tmp_path):
     assert gw.parse_job({"model": "qwen3", "text": "Hallo"}, s).ref_audio is None
     with pytest.raises(gw.RequestError):
         gw.parse_job({"model": "chatterbox", "text": "Hallo"}, gw.Settings())
+
+
+def _fake_hub(sizes, fail=()):
+    """Download-Funktionen ohne Netz: 'Herunterladen' füllt einen Zähler je Repo."""
+    have = {}
+
+    def size(repo):
+        return sizes.get(repo, 100)
+
+    def download(repo):
+        if repo in fail:
+            raise OSError("404")
+        have[repo] = size(repo)
+
+    return size, download, (lambda repo: have.get(repo, 0))
+
+
+def test_prefetcher_downloads_enabled_variants():
+    settings = gw.Settings(engines=["chatterbox", "qwen3"], qwen_size="0.6B")
+    size, download, cached = _fake_hub({})
+    pre = gw.Prefetcher(settings, download=download, size=size, cached=cached, poll=0.01)
+    assert [i["variant"] for i in pre.items] == ["chatterbox", "qwen3-custom", "qwen3-base", "qwen3-design"]
+    assert pre.status()["active"]
+    pre.run()
+    st = pre.status()
+    assert not st["active"]
+    assert all(i["state"] == "done" for i in st["items"])
+    assert st["done_bytes"] == st["total_bytes"] == 400
+    assert pre.items[1]["repo"] == "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"
+    assert pre.model_state("qwen3") == {"downloaded": True, "downloading": False, "download_progress": 1.0}
+
+
+def test_prefetcher_falls_back_and_reports_errors():
+    settings = gw.Settings(engines=["chatterbox-turbo", "chatterbox"])
+    turbo = gw.repo_candidates(settings, "chatterbox-turbo")
+    size, download, cached = _fake_hub({}, fail={turbo[0], "mlx-community/chatterbox-multilingual-v3"})
+    pre = gw.Prefetcher(settings, download=download, size=size, cached=cached, poll=0.01)
+    pre.run()
+    turbo_item, cb_item = pre.items
+    assert turbo_item["state"] == "done" and turbo_item["repo"] == turbo[1]
+    assert cb_item["state"] == "error" and "404" in cb_item["error"]
+    assert pre.model_state("chatterbox")["downloaded"] is False
+
+
+def test_gateway_status_and_models_show_download(tmp_path):
+    import httpx
+
+    settings = gw.Settings(upstream="http://127.0.0.1:9", engines=["qwen3"], fake=True)
+    size, download, cached = _fake_hub({})
+    pre = gw.Prefetcher(settings, download=download, size=size, cached=cached, poll=0.01)
+    gs, gs_t, url = _serve(gw.create_app(settings, gw.FakeBackend(), pre))
+    try:
+        st = httpx.get(url + "/gateway/status").json()
+        assert st["prefetch"]["active"] and st["engines"] == ["qwen3"]
+        qwen = next(m for m in httpx.get(url + "/models").json()["models"] if m["id"] == "qwen3")
+        assert qwen["downloaded"] is False
+        pre.start()
+        pre.thread.join(5)
+        qwen = next(m for m in httpx.get(url + "/models").json()["models"] if m["id"] == "qwen3")
+        assert qwen["downloaded"] is True and qwen["ready"] is True
+    finally:
+        gs.should_exit = True
+        gs_t.join(5)

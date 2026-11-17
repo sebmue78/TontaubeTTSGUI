@@ -146,6 +146,24 @@ def _control_slot_updates(specs: list[ControlSpec]) -> list[Any]:
 # Callbacks
 # ---------------------------------------------------------------------------
 
+def _model_update(models: list[dict], current: str | None = None):
+    """Dropdown-Update für die Modellauswahl laut ``GET /models`` (Tontaube ist immer dabei)."""
+    ids = {m["id"] for m in models} | {"tontaube"}
+    choices = [(k, v) for k, v in MODELS.items() if v in ids]
+    if current is not None and current not in ids:
+        return gr.update(choices=choices, value="tontaube")
+    if not models:
+        return gr.update(choices=choices, value="tontaube")
+    return gr.update(choices=choices)
+
+
+def model_choices_update(url: str, api_key: str, current: str | None):
+    models = _client(url, api_key, 5).models()
+    if not models:
+        return gr.skip()  # Gateway gerade nicht erreichbar: Auswahl lassen, wie sie ist
+    return _model_update(models, current)
+
+
 def check_server(url: str, api_key: str, timeout: float):
     client = _client(url, api_key, timeout)
     ok, msg = client.ready()
@@ -167,13 +185,10 @@ def check_server(url: str, api_key: str, timeout: float):
         lines.append(f"{len(VOICES)} mitgelieferte Stimmen verfügbar.")
         voice_update = gr.skip()
     models = client.models()
+    model_update = _model_update(models)
     if models:
         names = ", ".join(str(m.get("name", m["id"])) for m in models)
         lines.append(f"Modelle: {names}")
-        ids = {m["id"] for m in models}
-        model_update = gr.update(choices=[(k, v) for k, v in MODELS.items() if v in ids or v == "tontaube"])
-    else:
-        model_update = gr.update(choices=[(k, v) for k, v in MODELS.items() if v == "tontaube"], value="tontaube")
     if client.openapi():
         lines.append(f"API-Doku: {client.base_url}/docs")
     return ("\n\n".join(lines), specs, voice_update, model_update, *_control_slot_updates(specs))
@@ -590,7 +605,7 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                 gr.Markdown(
                     "Rechnen über **MLX** auf der Apple-GPU in einer eigenen Umgebung. Beim Einschalten werden "
                     "einmalig die Pakete installiert (ca. 1 GB); die Modelle selbst (je 1–4 GB) lädt der Server "
-                    "beim ersten Gebrauch. Die Android-App findet sie unter derselben Adresse und mit demselben "
+                    "direkt nach dem Start im Hintergrund herunter, der Fortschritt steht oben im Status. Die Android-App findet sie unter derselben Adresse und mit demselben "
                     "API-Key. **Tags** wie `[laugh]` versteht nur Chatterbox Turbo, und das nur auf Englisch."
                 )
                 with gr.Row():
@@ -979,11 +994,24 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             lan_newkey_btn.click(on_new_key, None, [lan_info, connected_state])
             lan_timer.tick(lambda: _lan_info_html(manager), None, lan_info, show_progress="hidden")
 
-            def do_restart(device, dtype):
+            def do_restart(device, dtype, enabled, engines, size):
+                # Auch hier die Zusatzmodell-Auswahl übernehmen, sonst startet der Server ohne sie neu.
+                manager.set_models(bool(enabled), list(engines or []), size)
                 threading.Thread(target=manager.restart, kwargs={"dtype": dtype, "device": device}, daemon=True).start()
                 return False
 
-            restart_btn.click(do_restart, [device_choice, dtype_choice], connected_state)
+            restart_btn.click(
+                do_restart, [device_choice, dtype_choice, models_enabled, models_engines, models_qwen_size],
+                connected_state,
+            )
+
+            def refresh_models(connected, current):
+                # Modellauswahl nachziehen, falls das Gateway nach dem Verbinden erst später antwortet.
+                if not connected or not manager.gateway_active or manager.state.phase != "ready":
+                    return gr.skip()
+                return model_choices_update(manager.url, manager.client_key, current)
+
+            lan_timer.tick(refresh_models, [connected_state, model], model, show_progress="hidden")
             device_choice.change(
                 lambda d: gr.update(value="float16" if d == "mps" else "bfloat16"),
                 device_choice,

@@ -193,6 +193,8 @@ class ServerManager:
         self._lan_active = False  # Stand des laufenden Servers (nicht der gespeicherten Einstellung)
         self._hf_cache = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
         self._cache_baseline = 0
+        self._gw_status: dict | None = None
+        self._gw_status_at = 0.0
         atexit.register(self.stop)
 
     # -- Status ----------------------------------------------------------
@@ -261,11 +263,56 @@ class ServerManager:
                 f"Genauigkeit: `{self.dtype}`{lan}"
             )
             if self._gateway_active:
-                names = ", ".join(EXTRA_MODELS[e].split(" (")[0] for e in self.models.engines)
-                lines.append(f"Zusatzmodelle: {names} (werden beim ersten Gebrauch geladen)")
+                lines.append(self.prefetch_markdown())
+            elif self.models.active and not self._gateway_error:
+                lines.append("Weitere Modelle sind eingeschaltet, laufen aber noch nicht: „Übernehmen“ oder "
+                             "„Server neu starten“ klicken.")
         if self._gateway_error:
             lines.append(f"⚠️ Zusatzmodelle nicht verfügbar: {self._gateway_error}")
         return "\n\n".join(lines)
+
+    def gateway_status(self, max_age: float = 3.0) -> dict | None:
+        """``GET /gateway/status`` des laufenden Gateways (kurz zwischengespeichert), sonst None."""
+        if not self._gateway_active or self.state.phase != "ready":
+            return None
+        now = time.time()
+        if now - self._gw_status_at < max_age:
+            return self._gw_status
+        self._gw_status_at = now
+        try:
+            headers = {"x-api-key": self.client_key} if self.client_key else {}
+            r = requests.get(self.state.url + "/gateway/status", headers=headers, timeout=2)
+            self._gw_status = r.json() if r.ok else None
+        except (requests.RequestException, ValueError):
+            self._gw_status = None
+        return self._gw_status
+
+    def prefetch_markdown(self) -> str:
+        """Eine Zeile zu den Zusatzmodellen: Download-Fortschritt oder bereit."""
+        names = ", ".join(EXTRA_MODELS[e].split(" (")[0] for e in self.models.engines)
+        status = self.gateway_status()
+        pre = (status or {}).get("prefetch") or None
+        if not pre or not pre.get("items"):
+            return f"Zusatzmodelle: {names} (werden beim ersten Gebrauch geladen)"
+        items = pre["items"]
+        done = sum(1 for i in items if i.get("state") == "done")
+        failed = [i for i in items if i.get("state") == "error"]
+        current = next((i for i in items if i.get("state") == "downloading"), None)
+        if current is not None:
+            got, total = current.get("done_bytes", 0) / 1e9, current.get("total_bytes", 0) / 1e9
+            size = f"{got:.1f} von {total:.1f} GB ({min(100, int(100 * got / total))} %)" if total else f"{got:.1f} GB"
+            rest = len(items) - done - 1
+            more = f", danach noch {rest}" if rest > 0 else ""
+            return (f"⬇️ Zusatzmodelle werden heruntergeladen ({done + 1} von {len(items)}{more}): "
+                    f"{current.get('label', '')} · {size}. Auswählen kannst du sie schon, die erste Anfrage "
+                    "wartet dann auf den Download.")
+        if any(i.get("state") == "pending" for i in items):
+            return f"⬇️ Zusatzmodelle: Download startet gleich ({names})."
+        if failed:
+            labels = ", ".join(i.get("label", "") for i in failed)
+            return (f"⚠️ Zusatzmodelle: Download fehlgeschlagen für {labels} (siehe Gateway-Log). "
+                    "Wird beim ersten Gebrauch erneut versucht.")
+        return f"✅ Zusatzmodelle heruntergeladen und bereit: {names}"
 
     # -- Netzwerk-Freigabe ----------------------------------------------
     @property
