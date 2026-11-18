@@ -7,6 +7,8 @@ daraus der Abschnitt der neuen Version (siehe [Releases erstellen](README.md#rel
 
 ## [Unveröffentlicht]
 
+## [0.4.0] – 2026-11-18
+
 ### macOS-App (Apple Silicon)
 - Ähnlichere Stimmklone: Das Referenzaudio wird automatisch aufbereitet (Stille am Anfang/Ende weg, lange Pausen gekürzt, Brummen gefiltert, optional leicht entrauscht) und auf die Länge gekürzt, die das gewählte Modell tatsächlich nutzt (Tontaube 60 s, Chatterbox 10 s, Turbo 15 s, Qwen3 12 s bzw. 20 s mit Transkript). Abschaltbar.
 - Qwen3: „Transkript automatisch erzeugen“ per Whisper (beim ersten Mal ca. 1,6 GB Download). Mit Transkript klont Qwen3 deutlich ähnlicher.
