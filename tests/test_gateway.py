@@ -141,7 +141,7 @@ def test_client_models_and_gui_payload(gateway):
     form = [
         "Hallo [sigh] Welt.", False, "Deutsch", "Konversation", 0.7, True, app.VOICE_BUNDLED, "samples/Juri.wav",
         None, "opus", 0, app.TRIM_DEFAULT, 250, False, False, "", "", "7", "", "", "", "",
-        "qwen3", 0.5, 0.5, "Ryan", "freundlich", "",
+        "qwen3", 0.5, 0.5, "Ryan", "freundlich", "", True, False,
     ]
     assert len(form) == app.N_FORM
     payload = app._collect(*form, [], [])
@@ -243,3 +243,30 @@ def test_gateway_status_and_models_show_download(tmp_path):
     finally:
         gs.should_exit = True
         gs_t.join(5)
+
+
+def test_transcribe_endpoint(gateway):
+    url, _ = gateway
+    c = TontaubeClient(url, api_key="secret")
+    wav = _sine_wav(3.0)
+    assert c.transcribe(wav, "german").startswith("Testtranskript (3.0 s, de)")
+    with pytest.raises(TontaubeError, match="zu kurz"):
+        c.transcribe(_sine_wav(0.2))
+    with pytest.raises(TontaubeError, match="unauthorized|401|API"):
+        TontaubeClient(url).transcribe(wav)
+
+
+def _sine_wav(seconds, sr=24000):
+    import io
+    import wave
+
+    import numpy as np
+
+    t = np.arange(int(seconds * sr)) / sr
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes((0.3 * np.sin(2 * np.pi * 220 * t) * 32767).astype("<i2").tobytes())
+    return buf.getvalue()
