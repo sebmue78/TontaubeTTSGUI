@@ -491,6 +491,29 @@ class TontaubeClient:
         fmt = str(body.get("format") or fmt)
         return SynthesisResult(_decode_b64(audio_field), fmt, body)
 
+    def transcribe(self, audio: bytes, language: str | None = None) -> str:
+        """Transkript eines Referenzaudios über ``POST /transcribe`` des Modell-Gateways (Whisper)."""
+        body: dict[str, Any] = {"audio_b64": base64.b64encode(audio).decode("ascii")}
+        if language:
+            body["language"] = language
+        try:
+            resp = self.session.post(self._url("/transcribe"), headers=self.headers, json=body,
+                                     timeout=max(self.timeout, 900))
+        except requests.Timeout as exc:
+            raise TontaubeError("Zeitüberschreitung beim Transkribieren.") from exc
+        except requests.RequestException as exc:
+            raise TontaubeError(f"Server unter {self.base_url} nicht erreichbar: {exc}") from exc
+        if resp.status_code in (404, 405):
+            raise TontaubeError("Automatisches Transkript gibt es nur mit „Weitere Modelle“ (Modell-Gateway).")
+        self._raise_for(resp)
+        try:
+            text = str(resp.json().get("text") or "").strip()
+        except (ValueError, AttributeError) as exc:
+            raise TontaubeError("Antwort von /transcribe ist kein JSON.") from exc
+        if not text:
+            raise TontaubeError("Whisper hat in der Referenz keine Sprache erkannt.")
+        return text
+
     def stream(self, payload: dict[str, Any]) -> Iterator[bytes]:
         """Streamt MP3-Chunks von ``POST /stream`` (Server-Sent Events)."""
         body = dict(payload)

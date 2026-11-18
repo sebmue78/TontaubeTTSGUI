@@ -41,9 +41,10 @@ from .client import (
     load_voice_catalog,
     wav_duration,
 )
+from .reference import MODEL_REF_HINT, QWEN_WITH_TEXT_SECONDS, max_seconds_for, prepare_reference, probe_duration
 
 MAX_CONTROL_SLOTS = 8
-N_FORM = 28  # Anzahl der Formularfelder vor den Regler-Slots (siehe build_ui: form)
+N_FORM = 30  # Anzahl der Formularfelder vor den Regler-Slots (siehe build_ui: form)
 QWEN_AUTO = "Automatisch (Klon oder Beschreibung)"
 VOICES = load_voice_catalog()
 
@@ -209,6 +210,34 @@ def check_server(url: str, api_key: str, timeout: float):
     return ("\n\n".join(lines), specs, voice_update, model_update, *_control_slot_updates(specs))
 
 
+def reference_hint(data: bytes, model: str | None, prep: bool, denoise: bool, ref_text: str = "") -> str:
+    """Hinweis unter dem Referenzaudio: Länge, was davon gesendet wird, Tipp fürs gewählte Modell."""
+    model = model or "tontaube"
+    dur = probe_duration(data)
+    tip = MODEL_REF_HINT.get(model, "")
+    if dur is None:
+        return f"Referenz geladen. {tip}"
+    lines = []
+    if dur < 5:
+        lines.append(f"⚠️ Referenz ist nur {dur:.1f} s lang. Empfohlen sind 10–20 s saubere Sprache.")
+    else:
+        lines.append(f"✅ Referenz: {dur:.1f} s")
+    if prep:
+        has_text = model == "qwen3" and bool((ref_text or "").strip())
+        prepared = prepare_reference(data, max_seconds_for(model, has_text), bool(denoise))
+        if prepared.changed and prepared.seconds_out is not None:
+            lines.append(f"Nach Aufbereitung gesendet: {prepared.seconds_out:.1f} s.")
+        elif prepared.note:
+            lines.append(prepared.note)
+    elif dur > 60:
+        lines.append("⚠️ Alles nach 60 s wird ignoriert.")
+    if model == "qwen3" and not (ref_text or "").strip():
+        lines.append("💡 Für Qwen3 ein Transkript eintragen oder erzeugen lassen – sonst nur grober Klon.")
+    if tip:
+        lines.append(tip)
+    return "  \n".join(lines)
+
+
 def _collect(
     text: str,
     segments: bool,
@@ -238,6 +267,8 @@ def _collect(
     qwen_speaker: str,
     qwen_instruct: str,
     qwen_ref_text: str,
+    ref_prep: bool,
+    ref_denoise: bool,
     specs: list[ControlSpec],
     slot_values: list[Any],
     *,
@@ -259,8 +290,12 @@ def _collect(
     vpath = None
     if voice_mode == VOICE_CLONE:
         if not voice_audio_path:
-            raise TontaubeError("Bitte ein Referenzaudio hochladen oder aufnehmen (ca. 5–60 s, eine Person).")
+            raise TontaubeError("Bitte ein Referenzaudio hochladen oder aufnehmen (ca. 10–20 s, eine Person).")
         voice_audio = Path(voice_audio_path).read_bytes()
+        if ref_prep:
+            has_text = model == "qwen3" and bool((qwen_ref_text or "").strip())
+            voice_audio = prepare_reference(
+                voice_audio, max_seconds_for(model or "tontaube", has_text), bool(ref_denoise)).audio
     elif voice_mode == VOICE_BUNDLED:
         vpath = (voice_path or "").strip() or None
         vpath = next((v.path for v in VOICES if vpath in (v.label, v.name)), vpath)
@@ -708,7 +743,13 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                                     "„Tiefe, raue Männerstimme, etwa 60 Jahre“",
                                 )
                             qwen_ref_text = gr.Textbox(
-                                "", label="Transkript des Referenzaudios (optional, verbessert den Klon)",
+                                "", label="Transkript des Referenzaudios (deutlich ähnlicherer Klon)",
+                                info="Wortgenau, nur das, was in den ersten 20 s der (aufbereiteten) "
+                                "Referenz gesprochen wird. Ohne Transkript klont Qwen3 nur grob.",
+                            )
+                            transcribe_btn = gr.Button(
+                                "Transkript automatisch erzeugen (Whisper, beim 1. Mal ca. 1,6 GB Download)",
+                                size="sm",
                             )
 
                         gr.Markdown("#### Stimme")
@@ -725,10 +766,20 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                         voice_audio = gr.Audio(
                             sources=["upload", "microphone"],
                             type="filepath",
-                            label="Referenzaudio (5–60 s, eine Person, wenig Hall/Rauschen)",
+                            label="Referenzaudio (10–20 s saubere Sprache einer Person, ohne Hall/Musik)",
                             visible=False,
                         )
                         voice_hint = gr.Markdown(visible=False)
+                        with gr.Row(visible=False) as ref_prep_row:
+                            ref_prep = gr.Checkbox(
+                                True, label="Referenz automatisch aufbereiten (empfohlen)",
+                                info="Stille am Anfang/Ende weg, lange Pausen kürzen, Brummen filtern, auf die "
+                                "Länge kürzen, die das Modell wirklich nutzt.",
+                            )
+                            ref_denoise = gr.Checkbox(
+                                False, label="Leicht entrauschen",
+                                info="Nur bei hörbarem Rauschen; kann die Klangfarbe leicht verändern.",
+                            )
 
                         with gr.Column() as controls_title:
                             gr.Markdown("#### Stil-Regler")
@@ -855,25 +906,41 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
                 gr.update(visible=mode == VOICE_BUNDLED),
                 gr.update(visible=mode == VOICE_CLONE),
                 gr.update(visible=mode == VOICE_CLONE),
+                gr.update(visible=mode == VOICE_CLONE),
             )
 
-        voice_mode.change(on_voice_mode, voice_mode, [voice_path, voice_audio, voice_hint])
+        voice_mode.change(on_voice_mode, voice_mode, [voice_path, voice_audio, voice_hint, ref_prep_row])
         language.change(lambda lang: gr.update(choices=voice_choices(lang)), language, voice_path)
 
-        def on_voice_audio(path):
+        def on_voice_audio(path, m, prep, denoise, ref_text):
             if not path:
                 return ""
-            data = Path(path).read_bytes()
-            dur = wav_duration(data)
-            if dur is None:
-                return "Referenz geladen."
-            if dur < 5:
-                return f"⚠️ Referenz ist nur {dur:.1f} s lang. Empfohlen sind 5–60 s."
-            if dur > 60:
-                return f"⚠️ Referenz ist {dur:.0f} s lang. Empfohlen sind 5–60 s."
-            return f"✅ Referenz: {dur:.1f} s"
+            return reference_hint(Path(path).read_bytes(), m, prep, denoise, ref_text)
 
-        voice_audio.change(on_voice_audio, voice_audio, voice_hint)
+        hint_inputs = [voice_audio, model, ref_prep, ref_denoise, qwen_ref_text]
+        voice_audio.change(on_voice_audio, hint_inputs, voice_hint)
+        for comp in (model, ref_prep, ref_denoise):
+            comp.change(on_voice_audio, hint_inputs, voice_hint)
+
+        def on_transcribe(srv, key, tmo, path, lang, prep, denoise):
+            if not path:
+                raise gr.Error("Bitte zuerst ein Referenzaudio hochladen oder aufnehmen.")
+            data = Path(path).read_bytes()
+            if prep:
+                # genau so aufbereiten wie später beim Senden mit Transkript, damit Text und Audio passen
+                data = prepare_reference(data, QWEN_WITH_TEXT_SECONDS, bool(denoise)).audio
+            try:
+                text = TontaubeClient(srv, key or None, float(tmo or 600)).transcribe(
+                    data, LANGUAGES.get(lang, lang) or None)
+            except TontaubeError as exc:
+                raise gr.Error(str(exc)) from exc
+            return text
+
+        transcribe_btn.click(
+            on_transcribe, [url, api_key, timeout, voice_audio, language, ref_prep, ref_denoise], qwen_ref_text,
+            concurrency_limit=1,
+        ).then(on_voice_audio, hint_inputs, voice_hint)
+        qwen_ref_text.blur(on_voice_audio, hint_inputs, voice_hint)
 
         def on_model(m):
             tt = m in (None, "", "tontaube")
@@ -927,6 +994,8 @@ def build_ui(default_url: str = DEFAULT_SERVER_URL, default_key: str = "", manag
             qwen_speaker,
             qwen_instruct,
             qwen_ref_text,
+            ref_prep,
+            ref_denoise,
             *slot_components,
         ]
         outputs = [

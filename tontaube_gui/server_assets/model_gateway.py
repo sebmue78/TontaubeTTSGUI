@@ -290,11 +290,35 @@ def decode_audio(data: bytes, sr: int, max_seconds: float = 20.0) -> np.ndarray:
         if proc.returncode == 0 and proc.stdout:
             return np.frombuffer(proc.stdout, dtype="<f4").copy()
         log.warning("ffmpeg konnte das Referenzaudio nicht lesen: %s", proc.stderr.decode(errors="replace")[-300:])
+    pcm = _decode_wav16(data, sr)
+    if pcm is not None:
+        return pcm[: int(max_seconds * sr)]
     import miniaudio
 
     dec = miniaudio.decode(data, output_format=miniaudio.SampleFormat.FLOAT32, nchannels=1, sample_rate=sr)
     arr = np.frombuffer(dec.samples, dtype=np.float32).copy()
     return arr[: int(max_seconds * sr)]
+
+
+def _decode_wav16(data: bytes, sr: int) -> np.ndarray | None:
+    """16-bit-PCM-WAV ohne ffmpeg/miniaudio lesen (mono, linear auf ``sr`` umgerechnet); sonst None."""
+    import io
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(data)) as w:
+            if w.getsampwidth() != 2:
+                return None
+            ch, rate = w.getnchannels(), w.getframerate()
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+    except (wave.Error, EOFError):
+        return None
+    if ch > 1:
+        x = x[: len(x) // ch * ch].reshape(-1, ch).mean(axis=1)
+    if rate != sr and x.size:
+        n = int(round(x.size * sr / rate))
+        x = np.interp(np.arange(n) * (rate / sr), np.arange(x.size), x).astype(np.float32)
+    return x
 
 
 class RequestError(Exception):
@@ -422,6 +446,15 @@ def _model_of(variant: str) -> str:
     return "qwen3" if variant.startswith("qwen3") else variant
 
 
+WHISPER_REPOS = ["mlx-community/whisper-large-v3-turbo-asr-fp16", "mlx-community/whisper-large-v3-turbo"]
+
+
+def whisper_repos() -> list[str]:
+    """Whisper-Gewichte fürs Transkript (``GATEWAY_WHISPER_REPO`` hat Vorrang)."""
+    own = os.environ.get("GATEWAY_WHISPER_REPO", "").strip()
+    return ([own] if own else []) + [r for r in WHISPER_REPOS if r != own]
+
+
 class Backend:
     """Rechnet Audio für einen Job. Liefert float32-Stücke (mono) mit :attr:`sample_rate`."""
 
@@ -434,6 +467,10 @@ class Backend:
         pass
 
     def synthesize(self, job: Job, cancel: threading.Event) -> Iterator[np.ndarray]:
+        raise NotImplementedError
+
+    def transcribe(self, audio_16k: np.ndarray, language: str | None) -> str:
+        """Transkript eines Referenzaudios (float32 mono 16 kHz), z. B. für den Qwen3-Klon."""
         raise NotImplementedError
 
 
@@ -462,6 +499,9 @@ class FakeBackend(Backend):
             t = np.arange(n, dtype=np.float32) / self.sample_rate
             yield (0.25 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
 
+    def transcribe(self, audio_16k: np.ndarray, language: str | None) -> str:
+        return f"Testtranskript ({audio_16k.size / 16000:.1f} s, {language or 'auto'})."
+
 
 class MlxBackend(Backend):
     """Echte Modelle über ``mlx-audio`` (Apple-GPU). Lädt Gewichte bei Bedarf, hält höchstens N im Speicher."""
@@ -471,9 +511,31 @@ class MlxBackend(Backend):
         self.models: collections.OrderedDict[str, Any] = collections.OrderedDict()
         self.repos: dict[str, str] = {}
         self._refs: collections.OrderedDict[str, Any] = collections.OrderedDict()
+        self._whisper: Any = None
 
     def loaded(self) -> list[str]:
         return list(self.models)
+
+    def transcribe(self, audio_16k: np.ndarray, language: str | None) -> str:
+        if self._whisper is None:
+            from mlx_audio.stt.utils import load_model as load_stt
+
+            errors = []
+            for repo in whisper_repos():
+                try:
+                    log.info("Lade Whisper (%s) …", repo)
+                    self._whisper = load_stt(repo)
+                    break
+                except Exception as exc:  # noqa: BLE001 - nächsten Kandidaten versuchen
+                    log.warning("Laden von %s fehlgeschlagen: %s", repo, exc)
+                    errors.append(f"{repo}: {exc}")
+            else:
+                raise RuntimeError("Whisper konnte nicht geladen werden. " + " | ".join(errors))
+        import mlx.core as mx
+
+        res = self._whisper.generate(mx.array(audio_16k), language=language, verbose=False,
+                                     condition_on_previous_text=False)
+        return " ".join(str(getattr(res, "text", res) or "").split())
 
     def ensure(self, variant: str) -> Any:
         if variant in self.models:
@@ -967,6 +1029,39 @@ def create_app(settings: Settings, backend: Backend | None = None, prefetcher: P
             body = {k: v for k, v in body.items() if k != "model"}
             raw = json.dumps(body).encode()
         return await _proxy(request, raw)
+
+    @app.post("/transcribe")
+    async def transcribe(request: Request):
+        """Referenzaudio → Text (Whisper), damit Qwen3 mit Transkript klonen kann."""
+        _raw, body = await _read_json(request)
+        if not body or not body.get("audio_b64"):
+            return JSONResponse({"error": "audio_b64 fehlt."}, status_code=422)
+        try:
+            data = base64.b64decode(str(body["audio_b64"]), validate=False)
+            audio = decode_audio(data, 16000, max_seconds=float(body.get("max_seconds") or 30))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": f"Audio nicht lesbar: {exc}"}, status_code=422)
+        if audio.size < 16000 // 2:
+            return JSONResponse({"error": "Audio ist zu kurz für ein Transkript."}, status_code=422)
+        lang = str(body.get("language") or "").strip().lower() or None
+        code = CHATTERBOX_LANGS.get(lang, lang) if lang else None
+
+        def run() -> str:
+            with worker.lock:
+                worker.loading = "whisper"
+                try:
+                    return backend.transcribe(audio, code)
+                finally:
+                    worker.loading = None
+
+        t0 = time.time()
+        try:
+            text = await asyncio.to_thread(run)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Transkript fehlgeschlagen")
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+        return {"text": text, "language": code, "duration_s": round(audio.size / 16000, 2),
+                "generation_s": round(time.time() - t0, 2)}
 
     @app.post("/stream")
     async def stream(request: Request):
