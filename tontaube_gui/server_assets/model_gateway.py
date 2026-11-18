@@ -290,11 +290,35 @@ def decode_audio(data: bytes, sr: int, max_seconds: float = 20.0) -> np.ndarray:
         if proc.returncode == 0 and proc.stdout:
             return np.frombuffer(proc.stdout, dtype="<f4").copy()
         log.warning("ffmpeg konnte das Referenzaudio nicht lesen: %s", proc.stderr.decode(errors="replace")[-300:])
+    pcm = _decode_wav16(data, sr)
+    if pcm is not None:
+        return pcm[: int(max_seconds * sr)]
     import miniaudio
 
     dec = miniaudio.decode(data, output_format=miniaudio.SampleFormat.FLOAT32, nchannels=1, sample_rate=sr)
     arr = np.frombuffer(dec.samples, dtype=np.float32).copy()
     return arr[: int(max_seconds * sr)]
+
+
+def _decode_wav16(data: bytes, sr: int) -> np.ndarray | None:
+    """16-bit-PCM-WAV ohne ffmpeg/miniaudio lesen (mono, linear auf ``sr`` umgerechnet); sonst None."""
+    import io
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(data)) as w:
+            if w.getsampwidth() != 2:
+                return None
+            ch, rate = w.getnchannels(), w.getframerate()
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+    except (wave.Error, EOFError):
+        return None
+    if ch > 1:
+        x = x[: len(x) // ch * ch].reshape(-1, ch).mean(axis=1)
+    if rate != sr and x.size:
+        n = int(round(x.size * sr / rate))
+        x = np.interp(np.arange(n) * (rate / sr), np.arange(x.size), x).astype(np.float32)
+    return x
 
 
 class RequestError(Exception):
